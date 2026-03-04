@@ -163,12 +163,8 @@ fn bench_insert_only(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let mut engine = SymbolEngine::new(
-                    Symbol::new(0),
-                    make_config(),
-                    StpMode::None,
-                    make_risk(),
-                );
+                let mut engine =
+                    SymbolEngine::new(Symbol::new(0), make_config(), StpMode::None, make_risk());
 
                 let start = std::time::Instant::now();
                 for i in 0..batch {
@@ -192,8 +188,7 @@ fn bench_insert_only(c: &mut Criterion) {
                         prev: NO_LINK,
                         next: NO_LINK,
                     };
-                    let events =
-                        engine.process_command(Command::PlaceOrder(order), 1, 0);
+                    let events = engine.process_command(Command::PlaceOrder(order), 1, 0);
                     black_box(events);
                 }
                 total += start.elapsed();
@@ -215,12 +210,8 @@ fn bench_insert_cancel(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let mut engine = SymbolEngine::new(
-                    Symbol::new(0),
-                    make_config(),
-                    StpMode::None,
-                    make_risk(),
-                );
+                let mut engine =
+                    SymbolEngine::new(Symbol::new(0), make_config(), StpMode::None, make_risk());
 
                 let start = std::time::Instant::now();
                 // Insert
@@ -239,17 +230,13 @@ fn bench_insert_cancel(c: &mut Criterion) {
                         prev: NO_LINK,
                         next: NO_LINK,
                     };
-                    let events =
-                        engine.process_command(Command::PlaceOrder(order), 1, 0);
+                    let events = engine.process_command(Command::PlaceOrder(order), 1, 0);
                     black_box(events);
                 }
                 // Cancel all
                 for i in 0..batch {
-                    let events = engine.process_command(
-                        Command::CancelOrder(OrderId::new(i + 1)),
-                        1,
-                        0,
-                    );
+                    let events =
+                        engine.process_command(Command::CancelOrder(OrderId::new(i + 1)), 1, 0);
                     black_box(events);
                 }
                 total += start.elapsed();

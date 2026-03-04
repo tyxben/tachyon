@@ -71,8 +71,12 @@ fn bench_place_no_match(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let mut engine =
-                        SymbolEngine::new(Symbol::new(0), make_config(), StpMode::None, make_risk());
+                    let mut engine = SymbolEngine::new(
+                        Symbol::new(0),
+                        make_config(),
+                        StpMode::None,
+                        make_risk(),
+                    );
 
                     // Pre-fill book
                     for i in 0..depth {
@@ -103,8 +107,12 @@ fn bench_single_fill(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let mut engine =
-                        SymbolEngine::new(Symbol::new(0), make_config(), StpMode::None, make_risk());
+                    let mut engine = SymbolEngine::new(
+                        Symbol::new(0),
+                        make_config(),
+                        StpMode::None,
+                        make_risk(),
+                    );
 
                     // Pre-fill asks: best ask at 50001, then 50002, ...
                     for i in 0..depth {
@@ -131,38 +139,33 @@ fn bench_sweep_levels(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine/sweep_levels");
 
     for &levels in &[1, 5, 10, 50] {
-        group.bench_with_input(
-            BenchmarkId::new("levels", levels),
-            &levels,
-            |b, &levels| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let mut engine = SymbolEngine::new(
-                            Symbol::new(0),
-                            make_config(),
-                            StpMode::None,
-                            make_risk(),
-                        );
+        group.bench_with_input(BenchmarkId::new("levels", levels), &levels, |b, &levels| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let mut engine = SymbolEngine::new(
+                        Symbol::new(0),
+                        make_config(),
+                        StpMode::None,
+                        make_risk(),
+                    );
 
-                        // Fill `levels` ask price levels, 1 order each
-                        for i in 0..levels {
-                            let order = make_order(i as u64, Side::Sell, 50001 + i as i64, 100);
-                            engine.process_command(Command::PlaceOrder(order), 1, 0);
-                        }
-
-                        // Market buy sweeps all levels
-                        let total_qty = (levels as u64) * 100;
-                        let order = make_market_order(levels as u64 + 1, Side::Buy, total_qty);
-                        let start = std::time::Instant::now();
-                        let _ =
-                            black_box(engine.process_command(Command::PlaceOrder(order), 2, 0));
-                        total += start.elapsed();
+                    // Fill `levels` ask price levels, 1 order each
+                    for i in 0..levels {
+                        let order = make_order(i as u64, Side::Sell, 50001 + i as i64, 100);
+                        engine.process_command(Command::PlaceOrder(order), 1, 0);
                     }
-                    total
-                });
-            },
-        );
+
+                    // Market buy sweeps all levels
+                    let total_qty = (levels as u64) * 100;
+                    let order = make_market_order(levels as u64 + 1, Side::Buy, total_qty);
+                    let start = std::time::Instant::now();
+                    let _ = black_box(engine.process_command(Command::PlaceOrder(order), 2, 0));
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
     }
 
     group.finish();
@@ -177,8 +180,12 @@ fn bench_cancel(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let mut engine =
-                        SymbolEngine::new(Symbol::new(0), make_config(), StpMode::None, make_risk());
+                    let mut engine = SymbolEngine::new(
+                        Symbol::new(0),
+                        make_config(),
+                        StpMode::None,
+                        make_risk(),
+                    );
 
                     for i in 0..depth {
                         let order = make_order(i as u64, Side::Buy, 50000 - i as i64, 100);
@@ -188,9 +195,7 @@ fn bench_cancel(c: &mut Criterion) {
                     // Cancel the middle order
                     let target = OrderId::new((depth / 2) as u64);
                     let start = std::time::Instant::now();
-                    let _ = black_box(
-                        engine.process_command(Command::CancelOrder(target), 1, 0),
-                    );
+                    let _ = black_box(engine.process_command(Command::CancelOrder(target), 1, 0));
                     total += start.elapsed();
                 }
                 total

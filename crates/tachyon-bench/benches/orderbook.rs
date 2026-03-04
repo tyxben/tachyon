@@ -42,17 +42,12 @@ fn bench_add_order(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let mut book =
-                        tachyon_book::OrderBook::new(Symbol::new(0), make_config());
+                    let mut book = tachyon_book::OrderBook::new(Symbol::new(0), make_config());
 
                     // Pre-fill with `depth` levels
                     for i in 0..depth {
-                        let _ = book.add_order(make_order(
-                            i as u64,
-                            Side::Buy,
-                            50000 - i as i64,
-                            100,
-                        ));
+                        let _ =
+                            book.add_order(make_order(i as u64, Side::Buy, 50000 - i as i64, 100));
                     }
 
                     // Benchmark adding one more order
@@ -77,16 +72,11 @@ fn bench_cancel_order(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let mut book =
-                        tachyon_book::OrderBook::new(Symbol::new(0), make_config());
+                    let mut book = tachyon_book::OrderBook::new(Symbol::new(0), make_config());
 
                     for i in 0..depth {
-                        let _ = book.add_order(make_order(
-                            i as u64,
-                            Side::Buy,
-                            50000 - i as i64,
-                            100,
-                        ));
+                        let _ =
+                            book.add_order(make_order(i as u64, Side::Buy, 50000 - i as i64, 100));
                     }
 
                     // Cancel the middle order
