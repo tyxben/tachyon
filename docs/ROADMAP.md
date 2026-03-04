@@ -1856,3 +1856,52 @@ Criterion 基准测试是一等公民:
 | 跨平台兼容性 | 低 | 低 | Linux 优先生产部署，macOS 开发兼容。ARM / x86 都支持 |
 | 依赖 crate 安全漏洞 | 低 | 低 | `cargo audit` 加入 CI，定期更新依赖 |
 | 内存安全 (unsafe bug) | 高 | 低 | Rust 保证 + Miri + SAFETY 注释审查 + unsafe 代码最小化 |
+
+---
+
+## Implementation Status
+
+> Updated: 2026-03-05
+
+### Completed Phases
+
+| Phase | Description | Test Count | Status |
+|-------|-------------|-----------|--------|
+| Phase 1 | Foundation: Core types (Price, Quantity, Order, Event) + OrderBook (BTreeMap + Slab + intrusive linked list) | 50 (core) + 49 (book) | Done |
+| Phase 2 | Engine + IO: Matcher + STP + Risk + SymbolEngine + Lock-free SPSC/MPSC queues | 37 (engine) + 13 (io) | Done |
+| Phase 3 | Networking: REST (axum) + WebSocket + TCP binary protocol + EngineBridge | 102 (gateway) + 51 (proto) | Done |
+| Phase 4 | Persistence + Observability: WAL + Snapshots + Recovery + Config + Metrics + Docker | 23 (persist) + 31 (server) | Done |
+
+**Total: 356 tests, all passing. Clippy clean, fmt clean.**
+
+### Deterministic Replay (Post-Phase 4 Enhancement)
+
+Key architectural change to the persistence layer:
+
+- **WAL now stores Commands (input) instead of Events (output)**
+  - `WalCommand { sequence, symbol_id, command, account_id, timestamp }`
+  - True write-ahead: command logged BEFORE engine processes it
+  - WAL v2 format with backward-compatible v1 legacy reader
+
+- **Deterministic recovery**: replaying the same command sequence on a fresh engine produces identical book state (verified by tests)
+
+- **Timestamp determinism**: `SymbolEngine::process_command` takes timestamp as parameter, never calls `SystemTime::now()`. Timestamps originate from bridge.rs for live traffic, from WAL entries for replay.
+
+- **Command serialization**: `Command` enum now derives `serde::Serialize` + `serde::Deserialize`
+
+### Remaining (Phase 5): Extreme Optimization
+
+- Zero-allocation audit (counting allocator)
+- PGO + LTO pipeline
+- SIMD batch price comparison
+- OS-level tuning (huge pages, isolcpus, SCHED_FIFO)
+- Advanced order types (Iceberg, Trailing Stop)
+
+### Benchmark Results
+
+| Metric | Measured |
+|--------|----------|
+| Order placement | ~54ns |
+| Mixed workload throughput | ~6.7M ops/sec |
+| BBO query | sub-nanosecond |
+| SPSC push/pop | ~11ns |

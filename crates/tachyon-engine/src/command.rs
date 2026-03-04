@@ -1,7 +1,7 @@
 use tachyon_core::*;
 
 /// Commands that can be sent to the matching engine.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     PlaceOrder(Order),
     CancelOrder(OrderId),

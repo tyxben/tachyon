@@ -1515,6 +1515,83 @@ segment_000003.wal ← 当前活跃 segment
                          可以安全删除已归档的旧 segment
 ```
 
+### 9.5 确定性重放 (Deterministic Replay) — 已实现
+
+> 本节描述当前已实现的持久化和恢复机制，与上述 9.1-9.4 的原始设计规划有所不同。
+
+#### 核心变更：WAL 存储 Command（输入）而非 Event（输出）
+
+原始设计中 WAL 存储 `EngineEvent`（引擎输出事件），恢复时需要从事件反向重建订单簿状态。
+这种方式复杂、脆弱、且不保证确定性。
+
+当前实现改为存储 `WalCommand`（引擎输入命令），包含：
+
+```rust
+pub struct WalCommand {
+    pub sequence: u64,      // 全局 WAL 序列号
+    pub symbol_id: u32,     // 目标交易对
+    pub command: Command,   // PlaceOrder / CancelOrder / ModifyOrder
+    pub account_id: u64,    // 账户 ID
+    pub timestamp: u64,     // 外部分配的时间戳（非 SystemTime::now()）
+}
+```
+
+#### 写前日志语义
+
+```
+                   Bridge (tokio)
+                       │
+                  EngineCommand { command, timestamp, ... }
+                       │
+                       ▼
+                 ┌─────────────────┐
+            ①   │ WAL: append_cmd  │  ← 写入 WalCommand（真正的 Write-Ahead）
+                 └────────┬────────┘
+                          │
+                          ▼
+            ②    engine.process_command(cmd, account_id, timestamp)
+                          │
+                          ▼
+            ③    events → response_tx → gateway → client
+```
+
+关键：命令在处理 **之前** 写入 WAL，确保崩溃恢复时不会丢失已确认的命令。
+
+#### WAL 版本兼容
+
+- **v2 (当前)**: `[version: u8=2][length: u32][sequence: u64][payload(WalCommand)][crc32]`
+- **v1 (遗留)**: `[length: u32][sequence: u64][payload(EngineEvent)][crc32]`
+
+读取时自动检测版本：首字节为 `2` 时按 v2 解析，否则按 v1 处理。
+v1 遗留事件走旧恢复路径（从事件重建），v2 命令走确定性重放路径。
+
+#### 确定性保证
+
+`SymbolEngine::process_command` 是一个纯状态机：
+
+- 输入：`(Command, account_id, timestamp)`
+- 输出：`SmallVec<[EngineEvent; 8]>`
+- **不调用** `SystemTime::now()` 或任何外部状态
+- 相同的输入序列必然产生相同的输出序列
+
+时间戳在 Gateway 的 `bridge.rs` 中生成（`SystemTime::now()`），嵌入到 `EngineCommand.timestamp` 中。
+WAL 记录的是原始时间戳，重放时使用 WAL 中保存的时间戳，因此重放是完全确定性的。
+
+#### 恢复流程
+
+```
+1. 加载最新 Snapshot (如有)
+   └─► 恢复订单簿、引擎计数器 (sequence, next_order_id, trade_id_counter)
+
+2. 读取 WAL 文件 (支持 v1 + v2 混合)
+   └─► 跳过 sequence <= snapshot_sequence 的条目
+
+3. v2 WalCommand → engine.process_command(cmd, account_id, timestamp)
+   v1 LegacyEvent → 旧路径：从事件重建订单簿状态
+
+4. 恢复完成，开始接受新命令
+```
+
 ---
 
 ## 10. 协议栈

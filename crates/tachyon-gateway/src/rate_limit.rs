@@ -189,8 +189,8 @@ mod tests {
         }
         assert!(!limiter.check(ip).await);
 
-        // Wait for refill (1000 rps = 1 token per ms, wait 10ms to get ~10 tokens, capped at 5)
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Wait for refill (1000 rps = 1 token per ms, wait 50ms to get ~50 tokens, capped at 5)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Should be allowed again after refill
         assert!(limiter.check(ip).await);

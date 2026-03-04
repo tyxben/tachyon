@@ -9,7 +9,7 @@ pub mod wal;
 
 pub use recovery::{RecoveredSymbolState, RecoveryManager, RecoveryState};
 pub use snapshot::{Snapshot, SnapshotReader, SnapshotWriter, SymbolSnapshot};
-pub use wal::{WalEntry, WalReader, WalWriter};
+pub use wal::{WalCommand, WalEntry, WalReader, WalWriter};
 
 use std::path::PathBuf;
 

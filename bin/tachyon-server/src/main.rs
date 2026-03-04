@@ -50,10 +50,11 @@ fn init_tracing(logging: &LoggingSection) {
     }
 }
 
-/// Replay a single WAL event into the appropriate engine's order book (C3 fix).
+/// Replay a single v1 legacy WAL event into the appropriate engine's order book.
 ///
-/// This reconstructs book state from WAL events that occurred after the last snapshot.
-fn replay_wal_event(engines: &mut HashMap<u32, SymbolEngine>, event: &EngineEvent) {
+/// This is only used for backward compatibility with v1 WAL files that stored events
+/// instead of commands. New WAL files use v2 command format with deterministic replay.
+fn replay_legacy_wal_event(engines: &mut HashMap<u32, SymbolEngine>, event: &EngineEvent) {
     match event {
         EngineEvent::OrderAccepted {
             order_id,
@@ -78,12 +79,10 @@ fn replay_wal_event(engines: &mut HashMap<u32, SymbolEngine>, event: &EngineEven
                     prev: NO_LINK,
                     next: NO_LINK,
                 };
-                // Ignore DuplicateOrderId errors (order may already exist from snapshot)
                 let _ = engine.book_mut().restore_order(order);
             }
         }
         EngineEvent::OrderCancelled { order_id, .. } => {
-            // Try to cancel in each engine (we don't know which symbol from event alone)
             for engine in engines.values_mut() {
                 if engine.book().get_order(*order_id).is_some() {
                     let _ = engine.book_mut().cancel_order(*order_id);
@@ -92,32 +91,20 @@ fn replay_wal_event(engines: &mut HashMap<u32, SymbolEngine>, event: &EngineEven
             }
         }
         EngineEvent::Trade { trade } => {
-            // Reduce the maker order's remaining_qty by the trade qty
             if let Some(engine) = engines.get_mut(&trade.symbol.raw()) {
                 if let Some(maker) = engine.book().get_order(trade.maker_order_id) {
                     let new_remaining = maker.remaining_qty.saturating_sub(trade.quantity);
                     if new_remaining.is_zero() {
-                        // Fully filled: remove the order
                         let _ = engine.book_mut().cancel_order(trade.maker_order_id);
-                    } else {
-                        // Partially filled: update remaining qty via the book's orders slab
-                        // We need to use the order_map to find the slab key, then update directly.
-                        // Since OrderBook doesn't expose a direct remaining_qty setter,
-                        // we handle this by removing and re-inserting with updated qty.
-                        // However, this loses time priority. For recovery correctness,
-                        // we accept this tradeoff since the order will be at the correct
-                        // position after all WAL events are replayed.
-                        if let Some(existing) = engine.book().get_order(trade.maker_order_id) {
-                            let mut updated = existing.clone();
-                            updated.remaining_qty = new_remaining;
-                            let _ = engine.book_mut().cancel_order(trade.maker_order_id);
-                            let _ = engine.book_mut().restore_order(updated);
-                        }
+                    } else if let Some(existing) = engine.book().get_order(trade.maker_order_id) {
+                        let mut updated = existing.clone();
+                        updated.remaining_qty = new_remaining;
+                        let _ = engine.book_mut().cancel_order(trade.maker_order_id);
+                        let _ = engine.book_mut().restore_order(updated);
                     }
                 }
             }
         }
-        // OrderRejected and BookUpdate don't change book state
         EngineEvent::OrderRejected { .. }
         | EngineEvent::BookUpdate { .. }
         | EngineEvent::OrderExpired { .. } => {}
@@ -199,9 +186,20 @@ async fn main() {
                         }
                     }
 
-                    // Replay WAL events that occurred after the snapshot (C3 fix)
-                    for (_seq, event) in &state.wal_events {
-                        replay_wal_event(&mut engines, event);
+                    // Replay v2 WAL commands deterministically (preferred path)
+                    for wal_cmd in &state.wal_commands {
+                        if let Some(engine) = engines.get_mut(&wal_cmd.symbol_id) {
+                            engine.process_command(
+                                wal_cmd.command.clone(),
+                                wal_cmd.account_id,
+                                wal_cmd.timestamp,
+                            );
+                        }
+                    }
+
+                    // Replay v1 legacy WAL events (backward compatibility)
+                    for (_seq, event) in &state.legacy_wal_events {
+                        replay_legacy_wal_event(&mut engines, event);
                     }
 
                     // Initialize global WAL sequence from recovery state (H10 fix)
@@ -209,8 +207,9 @@ async fn main() {
 
                     tracing::info!(
                         last_sequence = state.last_sequence,
-                        events_replayed = state.events_replayed,
-                        wal_events_applied = state.wal_events.len(),
+                        entries_replayed = state.events_replayed,
+                        wal_commands = state.wal_commands.len(),
+                        legacy_events = state.legacy_wal_events.len(),
                         symbols_recovered = state.snapshots.len(),
                         "Recovery complete"
                     );
@@ -597,6 +596,24 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
         spin_count = 0;
 
         for cmd in batch {
+            // Write command to WAL BEFORE processing (true write-ahead log)
+            if let Some(ref wal) = ctx.wal_writer {
+                if let Ok(ref mut writer) = wal.lock() {
+                    let seq = ctx.wal_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let wal_cmd = tachyon_persist::WalCommand {
+                        sequence: seq,
+                        symbol_id: cmd.symbol.raw(),
+                        command: cmd.command.clone(),
+                        account_id: cmd.account_id,
+                        timestamp: cmd.timestamp,
+                    };
+                    if let Err(e) = writer.append_command(&wal_cmd) {
+                        tracing::error!(error = %e, seq, "Failed to write WAL command");
+                    }
+                    events_since_snapshot += 1;
+                }
+            }
+
             // Measure matching engine latency
             let match_start = Instant::now();
             let events = ctx
@@ -754,54 +771,40 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                 }
             }
 
-            // Append events to WAL if persistence is configured
-            if let Some(ref wal) = ctx.wal_writer {
-                if let Ok(ref mut writer) = wal.lock() {
-                    for event in &events {
-                        // H10 fix: use global atomic sequence instead of per-thread local
-                        let seq = ctx.wal_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let Err(e) = writer.append(seq, event) {
-                            tracing::error!(error = %e, seq, "Failed to write WAL entry");
+            // Periodic snapshotting (after WAL write + command processing)
+            if ctx.snapshot_interval_events > 0
+                && events_since_snapshot >= ctx.snapshot_interval_events
+            {
+                if let Some(ref snap_dir) = ctx.snapshot_dir {
+                    let engine_snap = ctx.engine.snapshot_full_state();
+                    let current_seq = ctx.wal_sequence.load(Ordering::Relaxed);
+                    let sym_snapshot = tachyon_persist::SymbolSnapshot {
+                        symbol: engine_snap.symbol,
+                        config: engine_snap.config,
+                        orders: engine_snap.orders,
+                        next_order_id: engine_snap.next_order_id,
+                        sequence: engine_snap.sequence,
+                        trade_id_counter: engine_snap.trade_id_counter,
+                    };
+                    let snapshot = tachyon_persist::Snapshot {
+                        sequence: current_seq,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0),
+                        symbols: vec![sym_snapshot],
+                    };
+                    match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
+                        Ok(path) => {
+                            tracing::info!(
+                                path = %path.display(),
+                                sequence = current_seq,
+                                "Snapshot created"
+                            );
+                            events_since_snapshot = 0;
                         }
-                        events_since_snapshot += 1;
-                    }
-
-                    if ctx.snapshot_interval_events > 0
-                        && events_since_snapshot >= ctx.snapshot_interval_events
-                    {
-                        if let Some(ref snap_dir) = ctx.snapshot_dir {
-                            // C4 fix: use snapshot_full_state() to capture all engine counters
-                            let engine_snap = ctx.engine.snapshot_full_state();
-                            let current_seq = ctx.wal_sequence.load(Ordering::Relaxed);
-                            let sym_snapshot = tachyon_persist::SymbolSnapshot {
-                                symbol: engine_snap.symbol,
-                                config: engine_snap.config,
-                                orders: engine_snap.orders,
-                                next_order_id: engine_snap.next_order_id,
-                                sequence: engine_snap.sequence,
-                                trade_id_counter: engine_snap.trade_id_counter,
-                            };
-                            let snapshot = tachyon_persist::Snapshot {
-                                sequence: current_seq,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_nanos() as u64)
-                                    .unwrap_or(0),
-                                symbols: vec![sym_snapshot],
-                            };
-                            match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
-                                Ok(path) => {
-                                    tracing::info!(
-                                        path = %path.display(),
-                                        sequence = current_seq,
-                                        "Snapshot created"
-                                    );
-                                    events_since_snapshot = 0;
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Failed to create snapshot");
-                                }
-                            }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to create snapshot");
                         }
                     }
                 }

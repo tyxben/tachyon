@@ -14,3 +14,4 @@ smallvec = { workspace = true }
 crossbeam-utils = { workspace = true }
 core_affinity = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }

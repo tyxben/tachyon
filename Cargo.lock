@@ -1519,6 +1519,7 @@ version = "0.1.0"
 dependencies = [
  "core_affinity",
  "crossbeam-utils",
+ "serde",
  "smallvec",
  "tachyon-book",
  "tachyon-core",
