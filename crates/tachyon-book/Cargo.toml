@@ -1,0 +1,13 @@
+[package]
+name = "tachyon-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Order book data structures for the Tachyon matching engine"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+slab = { workspace = true }
+hashbrown = { workspace = true }
+smallvec = { workspace = true }

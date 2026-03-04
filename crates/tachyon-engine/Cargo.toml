@@ -1,0 +1,16 @@
+[package]
+name = "tachyon-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Matching engine, sequencer, and main loop for Tachyon"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-book = { path = "../tachyon-book" }
+tachyon-io = { path = "../tachyon-io" }
+smallvec = { workspace = true }
+crossbeam-utils = { workspace = true }
+core_affinity = { workspace = true }
+tracing = { workspace = true }

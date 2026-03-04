@@ -1,0 +1,12 @@
+[package]
+name = "tachyon-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Lock-free SPSC/MPSC queues for the Tachyon matching engine"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+crossbeam-utils = { workspace = true }
+arrayvec = { workspace = true }

@@ -1,0 +1,27 @@
+[package]
+name = "tachyon-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "API gateway (WebSocket, REST, FIX) for the Tachyon matching engine"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+tachyon-engine = { path = "../tachyon-engine" }
+tachyon-book = { path = "../tachyon-book" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = "0.5"
+http-body-util = "0.1"

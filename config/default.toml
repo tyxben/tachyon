@@ -1,0 +1,41 @@
+[server]
+bind_address = "0.0.0.0"
+websocket_port = 8080
+rest_port = 8081
+
+[engine]
+# sequencer_core = 0
+# matching_cores = [1, 2, 3, 4]
+
+[logging]
+level = "info"
+format = "json"
+
+[symbols.BTCUSDT]
+tick_size = "0.01"
+lot_size = "0.001"
+price_scale = 2
+qty_scale = 3
+max_price = "1000000.00"
+min_price = "0.01"
+max_order_qty = "1000.000"
+min_order_qty = "0.001"
+
+[symbols.ETHUSDT]
+tick_size = "0.01"
+lot_size = "0.01"
+price_scale = 2
+qty_scale = 2
+max_price = "100000.00"
+min_price = "0.01"
+max_order_qty = "10000.00"
+min_order_qty = "0.01"
+
+[persistence]
+wal_dir = "/tmp/tachyon/wal"
+snapshot_dir = "/tmp/tachyon/snapshots"
+fsync_strategy = "batched"
+fsync_batch_size = 1000
+max_wal_size_mb = 256
+snapshot_interval_events = 100000
+snapshot_interval_secs = 300
