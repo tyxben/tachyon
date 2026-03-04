@@ -1561,8 +1561,10 @@ dependencies = [
  "tachyon-core",
  "tachyon-engine",
  "tachyon-io",
+ "tachyon-proto",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tonic",
  "tower 0.5.3",
  "tracing",
@@ -1584,10 +1586,22 @@ dependencies = [
  "bincode",
  "crc32fast",
  "serde",
+ "tachyon-book",
  "tachyon-core",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "tachyon-proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "tachyon-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1605,6 +1619,7 @@ dependencies = [
  "tachyon-gateway",
  "tachyon-io",
  "tachyon-persist",
+ "tachyon-proto",
  "tokio",
  "toml",
  "tracing",

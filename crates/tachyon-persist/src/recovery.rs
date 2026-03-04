@@ -35,6 +35,9 @@ pub struct RecoveryState {
     pub last_sequence: u64,
     /// Number of WAL events replayed after the snapshot.
     pub events_replayed: u64,
+    /// Deserialized WAL events that occurred after the snapshot.
+    /// The caller should replay these through the engine to catch up.
+    pub wal_events: Vec<(u64, EngineEvent)>,
 }
 
 /// Orchestrates recovery from snapshot + WAL replay.
@@ -57,6 +60,7 @@ impl RecoveryManager {
             snapshots: HashMap::new(),
             last_sequence: 0,
             events_replayed: 0,
+            wal_events: Vec::new(),
         };
 
         // Step 1: Find and load the latest valid snapshot
@@ -125,8 +129,9 @@ impl RecoveryManager {
                     );
                 }
 
-                // Deserialize to verify the event is valid
-                let _event: EngineEvent = bincode::deserialize(&entry.data)?;
+                // Deserialize the event and store for replay
+                let event: EngineEvent = bincode::deserialize(&entry.data)?;
+                state.wal_events.push((entry.sequence, event));
 
                 prev_seq = entry.sequence;
                 state.last_sequence = entry.sequence;
@@ -315,5 +320,333 @@ mod tests {
         assert_eq!(state.last_sequence, 0);
         assert_eq!(state.events_replayed, 0);
         assert!(state.snapshots.is_empty());
+    }
+
+    #[test]
+    fn test_recovery_wal_events_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+
+        {
+            let mut writer =
+                WalWriter::new(&wal_dir, 1024 * 1024, FsyncStrategy::Sync).expect("writer");
+            for i in 1..=5 {
+                writer.append(i, &make_event(i, i * 1000)).expect("append");
+            }
+            writer.flush().expect("flush");
+        }
+
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        assert_eq!(state.wal_events.len(), 5);
+        for (i, (seq, event)) in state.wal_events.iter().enumerate() {
+            let expected_seq = (i + 1) as u64;
+            assert_eq!(*seq, expected_seq);
+            match event {
+                EngineEvent::OrderAccepted {
+                    order_id,
+                    timestamp,
+                    ..
+                } => {
+                    assert_eq!(order_id.raw(), expected_seq);
+                    assert_eq!(*timestamp, expected_seq * 1000);
+                }
+                _ => panic!("unexpected event variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_recovery_snapshot_plus_wal_events_filtered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+
+        // Snapshot at sequence 10
+        SnapshotWriter::write(&snap_dir, &make_snapshot_data(10)).expect("write snapshot");
+
+        // WAL from 1..20
+        {
+            let mut writer =
+                WalWriter::new(&wal_dir, 1024 * 1024, FsyncStrategy::Sync).expect("writer");
+            for i in 1..=20 {
+                writer.append(i, &make_event(i, i * 1000)).expect("append");
+            }
+            writer.flush().expect("flush");
+        }
+
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        // Only events 11..=20 should be in wal_events
+        assert_eq!(state.wal_events.len(), 10);
+        assert_eq!(state.wal_events[0].0, 11);
+        assert_eq!(state.wal_events[9].0, 20);
+    }
+
+    #[test]
+    fn test_recovery_full_roundtrip_with_book_restore() {
+        use tachyon_book::OrderBook;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+
+        // Create a snapshot with multiple orders at different prices
+        let config = SymbolConfig {
+            symbol: Symbol::new(0),
+            tick_size: Price::new(1),
+            lot_size: Quantity::new(1),
+            price_scale: 2,
+            qty_scale: 8,
+            max_price: Price::new(1_000_000),
+            min_price: Price::new(1),
+            max_order_qty: Quantity::new(1_000_000),
+            min_order_qty: Quantity::new(1),
+        };
+
+        let orders = vec![
+            Order {
+                id: OrderId::new(1),
+                symbol: Symbol::new(0),
+                side: Side::Buy,
+                price: Price::new(50000),
+                quantity: Quantity::new(100),
+                remaining_qty: Quantity::new(80),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: 1000,
+                account_id: 42,
+                prev: NO_LINK,
+                next: NO_LINK,
+            },
+            Order {
+                id: OrderId::new(2),
+                symbol: Symbol::new(0),
+                side: Side::Buy,
+                price: Price::new(49000),
+                quantity: Quantity::new(200),
+                remaining_qty: Quantity::new(200),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: 2000,
+                account_id: 43,
+                prev: NO_LINK,
+                next: NO_LINK,
+            },
+            Order {
+                id: OrderId::new(3),
+                symbol: Symbol::new(0),
+                side: Side::Sell,
+                price: Price::new(51000),
+                quantity: Quantity::new(150),
+                remaining_qty: Quantity::new(150),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: 3000,
+                account_id: 44,
+                prev: NO_LINK,
+                next: NO_LINK,
+            },
+        ];
+
+        let snapshot = Snapshot {
+            sequence: 50,
+            timestamp: 50_000_000,
+            symbols: vec![SymbolSnapshot {
+                symbol: Symbol::new(0),
+                config: config.clone(),
+                orders: orders.clone(),
+            }],
+        };
+
+        SnapshotWriter::write(&snap_dir, &snapshot).expect("write snapshot");
+
+        // Write some WAL entries after the snapshot
+        {
+            let mut writer =
+                WalWriter::new(&wal_dir, 1024 * 1024, FsyncStrategy::Sync).expect("writer");
+            for i in 1..=60 {
+                writer.append(i, &make_event(i, i * 1000)).expect("append");
+            }
+            writer.flush().expect("flush");
+        }
+
+        // Recover
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        assert_eq!(state.last_sequence, 60);
+        assert_eq!(state.events_replayed, 10); // entries 51-60
+
+        // Rebuild the order book from recovered state
+        let (recovered_config, recovered_orders) = &state.snapshots[&Symbol::new(0)];
+        let mut book = OrderBook::new(Symbol::new(0), recovered_config.clone());
+
+        for order in recovered_orders {
+            book.restore_order(order.clone()).expect("restore");
+        }
+
+        // Verify the book state matches the original snapshot
+        assert_eq!(book.order_count(), 3);
+        assert_eq!(book.best_bid_price(), Some(Price::new(50000)));
+        assert_eq!(book.best_ask_price(), Some(Price::new(51000)));
+
+        let o1 = book.get_order(OrderId::new(1)).expect("order 1");
+        assert_eq!(o1.remaining_qty, Quantity::new(80));
+        assert_eq!(o1.account_id, 42);
+
+        let o2 = book.get_order(OrderId::new(2)).expect("order 2");
+        assert_eq!(o2.remaining_qty, Quantity::new(200));
+
+        let o3 = book.get_order(OrderId::new(3)).expect("order 3");
+        assert_eq!(o3.remaining_qty, Quantity::new(150));
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_with_real_book() {
+        use tachyon_book::OrderBook;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let config = SymbolConfig {
+            symbol: Symbol::new(0),
+            tick_size: Price::new(1),
+            lot_size: Quantity::new(1),
+            price_scale: 2,
+            qty_scale: 8,
+            max_price: Price::new(1_000_000),
+            min_price: Price::new(1),
+            max_order_qty: Quantity::new(1_000_000),
+            min_order_qty: Quantity::new(1),
+        };
+
+        // Build a book with real orders
+        let mut book = OrderBook::new(Symbol::new(0), config.clone());
+        for i in 1..=5 {
+            let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
+            let price = if side == Side::Buy {
+                100 - i as i64
+            } else {
+                200 + i as i64
+            };
+            let order = Order {
+                id: OrderId::new(i),
+                symbol: Symbol::new(0),
+                side,
+                price: Price::new(price),
+                quantity: Quantity::new(i * 10),
+                remaining_qty: Quantity::new(i * 10),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: i * 1000,
+                account_id: i,
+                prev: NO_LINK,
+                next: NO_LINK,
+            };
+            book.add_order(order).expect("add");
+        }
+
+        // Extract orders and write snapshot
+        let all_orders = book.get_all_orders();
+        let snapshot = Snapshot {
+            sequence: 100,
+            timestamp: 100_000_000,
+            symbols: vec![SymbolSnapshot {
+                symbol: Symbol::new(0),
+                config: config.clone(),
+                orders: all_orders,
+            }],
+        };
+
+        let path = SnapshotWriter::write(dir.path(), &snapshot).expect("write");
+        let loaded = SnapshotReader::read(&path).expect("read");
+
+        // Rebuild book from loaded snapshot
+        let mut restored = OrderBook::new(Symbol::new(0), config);
+        for order in &loaded.symbols[0].orders {
+            restored.restore_order(order.clone()).expect("restore");
+        }
+
+        // Verify the restored book matches the original
+        assert_eq!(restored.order_count(), book.order_count());
+        assert_eq!(restored.best_bid_price(), book.best_bid_price());
+        assert_eq!(restored.best_ask_price(), book.best_ask_price());
+
+        for i in 1..=5 {
+            let orig = book.get_order(OrderId::new(i)).expect("orig");
+            let rest = restored.get_order(OrderId::new(i)).expect("rest");
+            assert_eq!(orig.id, rest.id);
+            assert_eq!(orig.price, rest.price);
+            assert_eq!(orig.side, rest.side);
+            assert_eq!(orig.remaining_qty, rest.remaining_qty);
+            assert_eq!(orig.account_id, rest.account_id);
+        }
+    }
+
+    #[test]
+    fn test_recovery_wal_only_no_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+
+        // Write only WAL entries, no snapshot
+        {
+            let mut writer =
+                WalWriter::new(&wal_dir, 1024 * 1024, FsyncStrategy::Sync).expect("writer");
+            for i in 1..=25 {
+                writer.append(i, &make_event(i, i * 1000)).expect("append");
+            }
+            writer.flush().expect("flush");
+        }
+
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        assert_eq!(state.last_sequence, 25);
+        assert_eq!(state.events_replayed, 25);
+        assert!(state.snapshots.is_empty());
+        assert_eq!(state.wal_events.len(), 25);
+
+        // Since no snapshot, we start with empty books,
+        // and the WAL events would need to be replayed through the engine.
+        // Verify the events are all present.
+        for (i, (seq, _)) in state.wal_events.iter().enumerate() {
+            assert_eq!(*seq, (i + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn test_recovery_clean_snapshot_no_wal() {
+        use tachyon_book::OrderBook;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).expect("create wal dir");
+
+        // Write only a snapshot, no WAL
+        SnapshotWriter::write(&snap_dir, &make_snapshot_data(100)).expect("write snapshot");
+
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        assert_eq!(state.last_sequence, 100);
+        assert_eq!(state.events_replayed, 0);
+        assert!(state.wal_events.is_empty());
+
+        // Rebuild from snapshot
+        let (config, orders) = &state.snapshots[&Symbol::new(0)];
+        let mut book = OrderBook::new(Symbol::new(0), config.clone());
+        for order in orders {
+            book.restore_order(order.clone()).expect("restore");
+        }
+
+        assert_eq!(book.order_count(), 1);
+        let o = book.get_order(OrderId::new(1)).expect("order");
+        assert_eq!(o.price, Price::new(50000));
+        assert_eq!(o.remaining_qty, Quantity::new(100));
     }
 }

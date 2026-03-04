@@ -10,6 +10,7 @@ description = "Tachyon matching engine server binary"
 tachyon-core = { path = "../../crates/tachyon-core" }
 tachyon-engine = { path = "../../crates/tachyon-engine" }
 tachyon-gateway = { path = "../../crates/tachyon-gateway" }
+tachyon-proto = { path = "../../crates/tachyon-proto" }
 tachyon-io = { path = "../../crates/tachyon-io" }
 tachyon-persist = { path = "../../crates/tachyon-persist" }
 core_affinity = { workspace = true }

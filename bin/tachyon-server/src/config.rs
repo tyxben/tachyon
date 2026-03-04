@@ -87,6 +87,8 @@ pub struct ServerSection {
     pub websocket_port: u16,
     #[serde(default = "default_rest_port")]
     pub rest_port: u16,
+    #[serde(default = "default_tcp_port")]
+    pub tcp_port: u16,
 }
 
 #[allow(dead_code)]
@@ -138,6 +140,10 @@ fn default_ws_port() -> u16 {
 
 fn default_rest_port() -> u16 {
     8081
+}
+
+fn default_tcp_port() -> u16 {
+    8082
 }
 
 fn default_min_qty() -> String {

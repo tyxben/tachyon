@@ -554,6 +554,93 @@ impl OrderBook {
         self.best_bid = self.bids.keys().next_back().copied();
         self.best_ask = self.asks.keys().next().copied();
     }
+
+    /// Returns all resting orders in the book.
+    ///
+    /// Iterates the orders slab and returns clones of every order. The linked-list
+    /// pointers (`prev`/`next`) are reset to `NO_LINK` in the returned orders
+    /// because they are slab-internal indices and meaningless outside the book.
+    pub fn get_all_orders(&self) -> Vec<Order> {
+        self.orders
+            .iter()
+            .map(|(_, order)| {
+                let mut o = order.clone();
+                o.prev = NO_LINK;
+                o.next = NO_LINK;
+                o
+            })
+            .collect()
+    }
+
+    /// Restores an order directly into the book without going through the matcher.
+    ///
+    /// This is used during recovery to rebuild the order book from a snapshot.
+    /// It inserts the order into the slab, adds it to the appropriate price level,
+    /// updates the order map, and refreshes BBO caches. Unlike `add_order()`, it
+    /// does **not** validate price/quantity bounds (the order was already validated
+    /// when it was originally placed).
+    pub fn restore_order(&mut self, mut order: Order) -> Result<(), EngineError> {
+        // Duplicate order check
+        if self.order_map.contains_key(&order.id) {
+            return Err(EngineError::DuplicateOrderId(order.id));
+        }
+
+        // Reset linked list pointers (will be set during insertion)
+        order.prev = NO_LINK;
+        order.next = NO_LINK;
+
+        let side = order.side;
+        let price = order.price;
+        let qty = order.remaining_qty;
+
+        // Insert order into slab
+        let order_key = self.orders.insert(order);
+
+        // Register in order_map
+        self.order_map.insert(self.orders[order_key].id, order_key);
+
+        // Find or create the price level
+        let side_map = self.side_map_mut(side);
+        let level_key = if let Some(&lk) = side_map.get(&price) {
+            lk
+        } else {
+            let new_level = PriceLevel::new(price);
+            let lk = self.levels.insert(new_level);
+            self.side_map_mut(side).insert(price, lk);
+            lk
+        };
+
+        // Append order to the price level's linked list tail
+        let level = &mut self.levels[level_key];
+        if level.is_empty() {
+            level.head_idx = order_key as u32;
+            level.tail_idx = order_key as u32;
+        } else {
+            let old_tail = level.tail_idx;
+            self.orders[old_tail as usize].next = order_key as u32;
+            self.orders[order_key].prev = old_tail;
+            self.levels[level_key].tail_idx = order_key as u32;
+        }
+
+        // Update level aggregates
+        self.levels[level_key].add_order_qty(qty);
+
+        // Update BBO cache
+        match side {
+            Side::Buy => match self.best_bid {
+                None => self.best_bid = Some(price),
+                Some(current) if price > current => self.best_bid = Some(price),
+                _ => {}
+            },
+            Side::Sell => match self.best_ask {
+                None => self.best_ask = Some(price),
+                Some(current) if price < current => self.best_ask = Some(price),
+                _ => {}
+            },
+        }
+
+        Ok(())
+    }
 }
 
 // =========================================================================
@@ -1407,5 +1494,250 @@ mod tests {
         assert_eq!(book.level_count(), 6);
 
         assert_book_consistent(&book);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_all_orders tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_all_orders_empty_book() {
+        let book = new_book();
+        let orders = book.get_all_orders();
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_orders_returns_correct_orders() {
+        let mut book = new_book();
+        book.add_order(make_order(1, Side::Buy, 100, 10))
+            .expect("add");
+        book.add_order(make_order(2, Side::Sell, 200, 20))
+            .expect("add");
+        book.add_order(make_order(3, Side::Buy, 90, 30))
+            .expect("add");
+
+        let orders = book.get_all_orders();
+        assert_eq!(orders.len(), 3);
+
+        // All orders should be present (order within the vec is not guaranteed
+        // because slab iteration order depends on insertion/removal history)
+        let mut ids: Vec<u64> = orders.iter().map(|o| o.id.raw()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // Linked-list pointers should be reset to NO_LINK
+        for o in &orders {
+            assert_eq!(o.prev, NO_LINK);
+            assert_eq!(o.next, NO_LINK);
+        }
+
+        // Field values should be preserved
+        let o1 = orders.iter().find(|o| o.id.raw() == 1).unwrap();
+        assert_eq!(o1.side, Side::Buy);
+        assert_eq!(o1.price, Price::new(100));
+        assert_eq!(o1.remaining_qty, Quantity::new(10));
+
+        let o2 = orders.iter().find(|o| o.id.raw() == 2).unwrap();
+        assert_eq!(o2.side, Side::Sell);
+        assert_eq!(o2.price, Price::new(200));
+        assert_eq!(o2.remaining_qty, Quantity::new(20));
+    }
+
+    #[test]
+    fn test_get_all_orders_after_partial_cancel() {
+        let mut book = new_book();
+        book.add_order(make_order(1, Side::Buy, 100, 10))
+            .expect("add");
+        book.add_order(make_order(2, Side::Buy, 100, 20))
+            .expect("add");
+        book.add_order(make_order(3, Side::Sell, 200, 30))
+            .expect("add");
+
+        book.cancel_order(OrderId::new(2)).expect("cancel");
+
+        let orders = book.get_all_orders();
+        assert_eq!(orders.len(), 2);
+        let mut ids: Vec<u64> = orders.iter().map(|o| o.id.raw()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // restore_order tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_restore_order_rebuilds_book_state() {
+        let mut book = new_book();
+
+        let order1 = Order {
+            id: OrderId::new(1),
+            symbol: Symbol::new(0),
+            side: Side::Buy,
+            price: Price::new(100),
+            quantity: Quantity::new(50),
+            remaining_qty: Quantity::new(30),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: 1000,
+            account_id: 42,
+            prev: NO_LINK,
+            next: NO_LINK,
+        };
+        let order2 = Order {
+            id: OrderId::new(2),
+            symbol: Symbol::new(0),
+            side: Side::Sell,
+            price: Price::new(200),
+            quantity: Quantity::new(100),
+            remaining_qty: Quantity::new(100),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: 2000,
+            account_id: 43,
+            prev: NO_LINK,
+            next: NO_LINK,
+        };
+
+        book.restore_order(order1).expect("restore 1");
+        book.restore_order(order2).expect("restore 2");
+
+        assert_eq!(book.order_count(), 2);
+        assert_eq!(book.best_bid_price(), Some(Price::new(100)));
+        assert_eq!(book.best_ask_price(), Some(Price::new(200)));
+
+        let o1 = book.get_order(OrderId::new(1)).expect("find 1");
+        assert_eq!(o1.remaining_qty, Quantity::new(30));
+        assert_eq!(o1.account_id, 42);
+
+        let o2 = book.get_order(OrderId::new(2)).expect("find 2");
+        assert_eq!(o2.remaining_qty, Quantity::new(100));
+
+        assert_book_consistent(&book);
+    }
+
+    #[test]
+    fn test_restore_order_multiple_at_same_price() {
+        let mut book = new_book();
+
+        for i in 1..=3 {
+            let order = Order {
+                id: OrderId::new(i),
+                symbol: Symbol::new(0),
+                side: Side::Buy,
+                price: Price::new(100),
+                quantity: Quantity::new(10 * i),
+                remaining_qty: Quantity::new(10 * i),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: i * 1000,
+                account_id: 1,
+                prev: NO_LINK,
+                next: NO_LINK,
+            };
+            book.restore_order(order).expect("restore");
+        }
+
+        assert_eq!(book.order_count(), 3);
+        let (_, level) = book.best_bid().expect("bbo");
+        assert_eq!(level.order_count, 3);
+        assert_eq!(level.total_quantity, Quantity::new(60)); // 10+20+30
+        assert_book_consistent(&book);
+    }
+
+    #[test]
+    fn test_restore_order_duplicate_rejected() {
+        let mut book = new_book();
+
+        let order = Order {
+            id: OrderId::new(1),
+            symbol: Symbol::new(0),
+            side: Side::Buy,
+            price: Price::new(100),
+            quantity: Quantity::new(10),
+            remaining_qty: Quantity::new(10),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: 1000,
+            account_id: 1,
+            prev: NO_LINK,
+            next: NO_LINK,
+        };
+
+        book.restore_order(order.clone()).expect("first restore");
+        let result = book.restore_order(order);
+        assert!(matches!(result, Err(EngineError::DuplicateOrderId(_))));
+    }
+
+    #[test]
+    fn test_restore_then_cancel_works() {
+        let mut book = new_book();
+
+        let order = Order {
+            id: OrderId::new(1),
+            symbol: Symbol::new(0),
+            side: Side::Buy,
+            price: Price::new(100),
+            quantity: Quantity::new(10),
+            remaining_qty: Quantity::new(10),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: 1000,
+            account_id: 1,
+            prev: NO_LINK,
+            next: NO_LINK,
+        };
+
+        book.restore_order(order).expect("restore");
+        assert_eq!(book.order_count(), 1);
+
+        let removed = book.cancel_order(OrderId::new(1)).expect("cancel");
+        assert_eq!(removed.id, OrderId::new(1));
+        assert_eq!(book.order_count(), 0);
+        assert!(book.best_bid().is_none());
+        assert_book_consistent(&book);
+    }
+
+    #[test]
+    fn test_restore_roundtrip_via_get_all_orders() {
+        // Build a book with orders, extract them, rebuild on a fresh book.
+        let mut original = new_book();
+        original
+            .add_order(make_order(1, Side::Buy, 100, 10))
+            .expect("add");
+        original
+            .add_order(make_order(2, Side::Buy, 100, 20))
+            .expect("add");
+        original
+            .add_order(make_order(3, Side::Sell, 200, 30))
+            .expect("add");
+        original
+            .add_order(make_order(4, Side::Sell, 210, 40))
+            .expect("add");
+
+        let orders = original.get_all_orders();
+
+        let mut restored = new_book();
+        for order in orders {
+            restored.restore_order(order).expect("restore");
+        }
+
+        assert_eq!(restored.order_count(), original.order_count());
+        assert_eq!(restored.best_bid_price(), original.best_bid_price());
+        assert_eq!(restored.best_ask_price(), original.best_ask_price());
+        assert_eq!(restored.level_count(), original.level_count());
+
+        // Verify each order is present with correct data
+        for id in [1, 2, 3, 4] {
+            let orig = original.get_order(OrderId::new(id)).expect("find orig");
+            let rest = restored.get_order(OrderId::new(id)).expect("find rest");
+            assert_eq!(orig.id, rest.id);
+            assert_eq!(orig.price, rest.price);
+            assert_eq!(orig.side, rest.side);
+            assert_eq!(orig.remaining_qty, rest.remaining_qty);
+        }
+
+        assert_book_consistent(&restored);
     }
 }

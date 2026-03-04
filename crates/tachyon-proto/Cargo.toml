@@ -1,0 +1,16 @@
+[package]
+name = "tachyon-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Compact binary wire protocol for the Tachyon matching engine"
+
+[dependencies]
+tachyon-core = { path = "../tachyon-core" }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -158,9 +158,31 @@ impl SymbolEngine {
         &self.book
     }
 
+    /// Returns a mutable reference to the order book.
+    ///
+    /// Used during recovery to restore orders directly into the book.
+    #[inline]
+    pub fn book_mut(&mut self) -> &mut OrderBook {
+        &mut self.book
+    }
+
     /// Returns the current engine sequence number.
     #[inline]
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Returns the symbol this engine handles.
+    #[inline]
+    pub fn symbol(&self) -> Symbol {
+        self.symbol
+    }
+
+    /// Sets the engine sequence number.
+    ///
+    /// Used during recovery to restore the sequence to the snapshot value.
+    #[inline]
+    pub fn set_sequence(&mut self, seq: u64) {
+        self.sequence = seq;
     }
 }

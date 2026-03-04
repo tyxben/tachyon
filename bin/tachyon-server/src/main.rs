@@ -14,6 +14,7 @@ use tachyon_core::*;
 use tachyon_engine::{RiskConfig, StpMode, SymbolEngine};
 use tachyon_gateway::bridge::{EngineBridge, EngineCommand};
 use tachyon_gateway::rest::{rest_router, AppState};
+use tachyon_gateway::tcp::{run_tcp_server, TcpState};
 use tachyon_gateway::types::{
     OrderBookLevel, OrderBookResponse, TickerResponse, TradeResponse, WsServerMessage,
 };
@@ -95,9 +96,25 @@ async fn main() {
         match recovery_mgr.recover() {
             Ok(state) => {
                 if state.last_sequence > 0 {
+                    // Restore order book state from snapshot
+                    for (symbol, (_, orders)) in &state.snapshots {
+                        if let Some(engine) = engines.get_mut(&symbol.raw()) {
+                            for order in orders {
+                                if let Err(e) = engine.book_mut().restore_order(order.clone()) {
+                                    tracing::warn!(
+                                        order_id = order.id.raw(),
+                                        error = %e,
+                                        "Failed to restore order during recovery"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     tracing::info!(
                         last_sequence = state.last_sequence,
                         events_replayed = state.events_replayed,
+                        symbols_recovered = state.snapshots.len(),
                         "Recovery complete"
                     );
                 } else {
@@ -296,9 +313,21 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Failed to bind WebSocket on {}: {}", ws_addr, e));
     tracing::info!(address = %ws_addr, "WebSocket server listening");
 
+    // Bind TCP binary protocol server
+    let tcp_addr = format!("{}:{}", config.server.bind_address, config.server.tcp_port);
+    let tcp_listener = tokio::net::TcpListener::bind(&tcp_addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind TCP on {}: {}", tcp_addr, e));
+    tracing::info!(address = %tcp_addr, "TCP binary protocol server listening");
+
+    let tcp_state = TcpState {
+        bridge: bridge.clone(),
+        seq_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    };
+
     tracing::info!("Tachyon engine ready");
 
-    // Run both servers and wait for shutdown signal
+    // Run all servers and wait for shutdown signal
     tokio::select! {
         result = axum::serve(rest_listener, rest_app) => {
             if let Err(e) = result {
@@ -309,6 +338,9 @@ async fn main() {
             if let Err(e) = result {
                 tracing::error!(error = %e, "WebSocket server error");
             }
+        }
+        _ = run_tcp_server(tcp_listener, tcp_state) => {
+            tracing::error!("TCP binary protocol server exited unexpectedly");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Shutting down...");
@@ -523,13 +555,18 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                         && events_since_snapshot >= ctx.snapshot_interval_events
                     {
                         if let Some(ref snap_dir) = ctx.snapshot_dir {
+                            let sym_snapshot = tachyon_persist::SymbolSnapshot {
+                                symbol: ctx.engine.book().symbol(),
+                                config: ctx.engine.book().config().clone(),
+                                orders: ctx.engine.book().get_all_orders(),
+                            };
                             let snapshot = tachyon_persist::Snapshot {
                                 sequence,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_nanos() as u64)
                                     .unwrap_or(0),
-                                symbols: Vec::new(),
+                                symbols: vec![sym_snapshot],
                             };
                             match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
                                 Ok(path) => {
