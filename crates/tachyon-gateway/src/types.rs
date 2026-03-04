@@ -84,6 +84,25 @@ pub struct TickerResponse {
 pub struct HealthResponse {
     pub status: String,
     pub uptime_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engines: Option<Vec<EngineStatus>>,
+}
+
+/// Status of a single symbol engine thread.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EngineStatus {
+    pub symbol: String,
+    pub alive: bool,
+}
+
+/// Server status response for `/api/v1/status`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatusResponse {
+    pub version: String,
+    pub uptime_secs: u64,
+    pub symbols: Vec<String>,
+    pub ws_connections_active: i64,
+    pub tcp_connections_active: i64,
 }
 
 /// Messages sent from WebSocket clients (single-channel legacy format).
@@ -267,10 +286,27 @@ mod tests {
         let resp = HealthResponse {
             status: "ok".to_string(),
             uptime_secs: 3600,
+            engines: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         let parsed: HealthResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.uptime_secs, 3600);
+    }
+
+    #[test]
+    fn test_status_response_roundtrip() {
+        let resp = StatusResponse {
+            version: "0.1.0".to_string(),
+            uptime_secs: 120,
+            symbols: vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            ws_connections_active: 5,
+            tcp_connections_active: 2,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let parsed: StatusResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.version, "0.1.0");
+        assert_eq!(parsed.symbols.len(), 2);
+        assert_eq!(parsed.ws_connections_active, 5);
     }
 
     #[test]

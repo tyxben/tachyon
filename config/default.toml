@@ -3,6 +3,9 @@ bind_address = "0.0.0.0"
 websocket_port = 8080
 rest_port = 8081
 tcp_port = 8082
+max_ws_connections = 1000
+max_tcp_connections = 500
+shutdown_timeout_secs = 5
 
 [engine]
 # sequencer_core = 0
@@ -31,6 +34,15 @@ max_price = "100000.00"
 min_price = "0.01"
 max_order_qty = "10000.00"
 min_order_qty = "0.01"
+
+[rate_limit]
+enabled = true
+requests_per_second = 100
+burst_size = 200
+
+[auth]
+enabled = false
+api_keys = ["key1", "key2"]
 
 [persistence]
 wal_dir = "/tmp/tachyon/wal"

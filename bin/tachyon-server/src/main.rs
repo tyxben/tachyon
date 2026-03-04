@@ -4,7 +4,7 @@ mod config;
 mod metrics;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -19,6 +19,7 @@ use tachyon_gateway::types::{
     OrderBookLevel, OrderBookResponse, TickerResponse, TradeResponse, WsServerMessage,
 };
 use tachyon_gateway::ws::{ws_handler, WsState};
+use tachyon_gateway::{auth_middleware, AuthConfig, AuthState, RateLimitConfig, RateLimiter};
 use tachyon_io::SpscQueue;
 use tokio::sync::broadcast;
 use tracing_subscriber::prelude::*;
@@ -180,9 +181,15 @@ async fn main() {
     // Global shutdown flag for engine threads
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Create per-symbol engine alive flags
+    let mut engine_alive: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+    for name in symbol_configs.keys() {
+        engine_alive.insert(name.clone(), Arc::new(AtomicBool::new(true)));
+    }
+
     // Create WebSocket state (broadcast channel for real-time market data push).
     // Must be created before engine threads so they can publish events.
-    let ws_state = WsState::new(4096);
+    let ws_state = WsState::with_limit(4096, config.server.max_ws_connections);
 
     // Get available CPU cores for affinity pinning
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -204,6 +211,11 @@ async fn main() {
         let thread_shutdown = shutdown.clone();
         let thread_symbol_info = symbol_info.get(&symbol_id).cloned();
         let thread_ws_tx = ws_state.event_tx.clone();
+
+        // Get the engine alive flag for this symbol
+        let thread_alive = thread_symbol_info
+            .as_ref()
+            .and_then(|(name, _)| engine_alive.get(name).cloned());
 
         // Pick a core for CPU pinning (round-robin across available cores, skip core 0 for OS)
         let pin_core = if core_ids.len() > 1 {
@@ -245,6 +257,7 @@ async fn main() {
                     order_registry: thread_order_registry,
                     shutdown: thread_shutdown,
                     ws_event_tx: thread_ws_tx,
+                    alive_flag: thread_alive,
                 });
             })
             .unwrap_or_else(|e| {
@@ -260,6 +273,9 @@ async fn main() {
     let bridge = Arc::new(bridge);
     let start_time = Instant::now();
 
+    // Collect symbol names for the status endpoint.
+    let symbol_names: Vec<String> = symbol_configs.keys().cloned().collect();
+
     // Create REST app state
     let app_state = AppState {
         bridge: bridge.clone(),
@@ -269,27 +285,46 @@ async fn main() {
         book_snapshots,
         order_registry,
         start_time,
+        engine_alive: Arc::new(engine_alive),
+        request_id_counter: Arc::new(AtomicU64::new(1)),
+        metrics: Some(metrics.clone() as Arc<dyn tachyon_gateway::MetricsProvider>),
+        symbol_names: Arc::new(symbol_names),
     };
 
-    // Build REST router with metrics endpoint
-    let metrics_handle = metrics.clone();
-    let rest_app = rest_router(app_state).route(
-        "/metrics",
-        axum::routing::get(move || {
-            let m = metrics_handle.clone();
-            async move {
-                let body = m.encode();
-                (
-                    axum::http::StatusCode::OK,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/plain; version=0.0.4",
-                    )],
-                    body,
-                )
-            }
-        }),
-    );
+    // Build auth state
+    let auth_config = AuthConfig {
+        enabled: config.auth.enabled,
+        api_keys: config.auth.api_keys.iter().cloned().collect(),
+    };
+    let auth_state = AuthState::new(auth_config.clone());
+
+    if auth_config.enabled {
+        tracing::info!(
+            num_keys = auth_config.api_keys.len(),
+            "API key authentication enabled"
+        );
+    }
+
+    // Build rate limiter
+    let rate_limit_config = RateLimitConfig {
+        enabled: config.rate_limit.enabled,
+        requests_per_second: config.rate_limit.requests_per_second,
+        burst_size: config.rate_limit.burst_size,
+    };
+    if rate_limit_config.enabled {
+        tracing::info!(
+            rps = rate_limit_config.requests_per_second,
+            burst = rate_limit_config.burst_size,
+            "Rate limiting enabled"
+        );
+    }
+    let _rate_limiter = RateLimiter::new(rate_limit_config);
+
+    // Build REST router with auth middleware
+    let rest_app = rest_router(app_state).layer(axum::middleware::from_fn_with_state(
+        auth_state,
+        auth_middleware,
+    ));
 
     // Build WebSocket router
     let ws_app = axum::Router::new()
@@ -322,10 +357,14 @@ async fn main() {
 
     let tcp_state = TcpState {
         bridge: bridge.clone(),
-        seq_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        seq_counter: Arc::new(AtomicU64::new(1)),
+        active_connections: Arc::new(AtomicU64::new(0)),
+        max_connections: config.server.max_tcp_connections,
     };
 
     tracing::info!("Tachyon engine ready");
+
+    let shutdown_timeout_secs = config.server.shutdown_timeout_secs;
 
     // Run all servers and wait for shutdown signal
     tokio::select! {
@@ -343,14 +382,36 @@ async fn main() {
             tracing::error!("TCP binary protocol server exited unexpectedly");
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutting down...");
+            tracing::info!("Received shutdown signal, beginning graceful shutdown...");
         }
     }
 
-    // Signal engine threads to stop and wait for them
+    // Graceful shutdown with timeout
+    tracing::info!(
+        timeout_secs = shutdown_timeout_secs,
+        "Draining in-flight requests and shutting down engines..."
+    );
+
+    let shutdown_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(shutdown_timeout_secs);
+
+    // Signal engine threads to stop (they will drain remaining SPSC queue items)
     shutdown.store(true, Ordering::Release);
-    for handle in engine_threads {
-        let _ = handle.join();
+
+    // Wait for engine threads with timeout
+    let engine_join = tokio::task::spawn_blocking(move || {
+        for handle in engine_threads {
+            let _ = handle.join();
+        }
+    });
+
+    tokio::select! {
+        _ = engine_join => {
+            tracing::info!("All engine threads stopped");
+        }
+        _ = tokio::time::sleep_until(shutdown_deadline) => {
+            tracing::warn!("Shutdown timeout reached, forcing exit");
+        }
     }
 
     // Graceful shutdown: flush WAL
@@ -363,6 +424,8 @@ async fn main() {
             }
         }
     }
+
+    tracing::info!("Shutdown complete");
 }
 
 /// Per-symbol engine thread context.
@@ -380,6 +443,8 @@ struct EngineThreadCtx {
     shutdown: Arc<AtomicBool>,
     /// Broadcast sender for real-time WebSocket market data push.
     ws_event_tx: broadcast::Sender<WsServerMessage>,
+    /// Per-symbol alive flag set to false when the engine thread exits.
+    alive_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Maximum number of commands to drain per batch iteration.
@@ -399,28 +464,38 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
 
         if batch.is_empty() {
             if ctx.shutdown.load(Ordering::Acquire) {
-                break;
-            }
-            // Progressive backoff: spin briefly, then yield to OS
-            spin_count += 1;
-            if spin_count < 1000 {
-                std::hint::spin_loop();
+                // Drain any remaining commands before exiting
+                ctx.queue.drain_batch(&mut batch);
+                if batch.is_empty() {
+                    break;
+                }
+                // Fall through to process the final batch below
             } else {
-                std::thread::yield_now();
-                spin_count = 0;
+                // Progressive backoff: spin briefly, then yield to OS
+                spin_count += 1;
+                if spin_count < 1000 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                    spin_count = 0;
+                }
+                continue;
             }
-            continue;
         }
 
         spin_count = 0;
 
         for cmd in batch {
+            // Measure matching engine latency
+            let match_start = Instant::now();
             let events = {
                 let result = ctx
                     .engine
                     .process_command(cmd.command, cmd.account_id, cmd.timestamp);
                 result.to_vec()
             };
+            let match_elapsed_ns = match_start.elapsed().as_nanos() as u64;
+            ctx.metrics.match_latency_ns.observe(match_elapsed_ns);
 
             // Update metrics, trades, order registry, and push WS market data
             let mut has_book_change = false;
@@ -428,9 +503,19 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
             for event in &events {
                 match event {
                     EngineEvent::OrderAccepted {
-                        order_id, symbol, ..
+                        order_id,
+                        symbol,
+                        side,
+                        ..
                     } => {
-                        ctx.metrics.orders_total.inc();
+                        // Determine order type label from the command (we infer from price for simplicity)
+                        let side_str = match side {
+                            Side::Buy => "buy",
+                            Side::Sell => "sell",
+                        };
+                        // We record as "limit" by default; market orders are relatively rare
+                        // and we don't have the order type in the event. This is a best-effort label.
+                        ctx.metrics.orders_total.inc(side_str, "limit");
                         has_book_change = true;
                         ctx.order_registry
                             .write()
@@ -438,7 +523,7 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                             .insert(order_id.raw(), *symbol);
                     }
                     EngineEvent::Trade { trade } => {
-                        ctx.metrics.trades_total.inc();
+                        ctx.metrics.trades_total.fetch_add(1, Ordering::Relaxed);
                         has_book_change = true;
                         if let Some((ref name, ref config)) = ctx.symbol_info {
                             let trade_resp = TradeResponse {
@@ -472,8 +557,13 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                         }
                     }
                     EngineEvent::OrderCancelled { order_id, .. } => {
+                        ctx.metrics.cancels_total.fetch_add(1, Ordering::Relaxed);
                         has_book_change = true;
                         ctx.order_registry.write().unwrap().remove(&order_id.raw());
+                    }
+                    EngineEvent::OrderRejected { reason, .. } => {
+                        let reason_str = format!("{:?}", reason);
+                        ctx.metrics.rejects_total.inc(&reason_str);
                     }
                     EngineEvent::BookUpdate { .. } => {
                         has_book_change = true;
@@ -500,6 +590,18 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                             quantity: format_qty_raw(qty.raw(), config.qty_scale),
                         })
                         .collect();
+
+                    // Update book depth gauges
+                    ctx.metrics
+                        .book_depth_bids
+                        .store(bids.len() as i64, Ordering::Relaxed);
+                    ctx.metrics
+                        .book_depth_asks
+                        .store(asks.len() as i64, Ordering::Relaxed);
+                    ctx.metrics
+                        .book_orders_count
+                        .store(ctx.engine.book().order_count() as i64, Ordering::Relaxed);
+
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -585,6 +687,11 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
             // Send response back to the gateway (ignore errors if caller dropped)
             let _ = cmd.response_tx.send(events);
         }
+    }
+
+    // Signal that this engine thread has exited
+    if let Some(ref flag) = ctx.alive_flag {
+        flag.store(false, Ordering::Release);
     }
 }
 

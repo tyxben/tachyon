@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
@@ -14,19 +17,47 @@ use crate::types::{
 #[derive(Clone)]
 pub struct WsState {
     pub event_tx: broadcast::Sender<WsServerMessage>,
+    /// Current number of active WebSocket connections.
+    pub active_connections: Arc<AtomicU64>,
+    /// Maximum allowed WebSocket connections (0 = unlimited).
+    pub max_connections: u64,
 }
 
 impl WsState {
     /// Creates a new WsState with a broadcast channel of the given capacity.
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        WsState { event_tx: tx }
+        WsState {
+            event_tx: tx,
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
+        }
+    }
+
+    /// Creates a new WsState with a broadcast channel and connection limit.
+    pub fn with_limit(capacity: usize, max_connections: u64) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        WsState {
+            event_tx: tx,
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections,
+        }
     }
 }
 
 /// Axum handler for upgrading an HTTP connection to WebSocket.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> impl IntoResponse {
+    // Check connection limit before upgrading
+    if state.max_connections > 0 {
+        let current = state.active_connections.load(Ordering::Relaxed);
+        if current >= state.max_connections {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+
+    state.active_connections.fetch_add(1, Ordering::Relaxed);
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+        .into_response()
 }
 
 /// Handles a single WebSocket connection.
@@ -48,6 +79,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
                                 Err(_) => continue,
                             };
                             if sender.send(Message::Text(json)).await.is_err() {
+                                state.active_connections.fetch_sub(1, Ordering::Relaxed);
                                 return;
                             }
                         }
@@ -85,6 +117,10 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
             }
         }
     }
+
+    // Send a close frame before disconnecting
+    let _ = sender.send(Message::Close(None)).await;
+    state.active_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Validates that a channel string uses a known prefix format.

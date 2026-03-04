@@ -13,6 +13,54 @@ pub struct ServerConfig {
     #[serde(default)]
     pub logging: LoggingSection,
     pub persistence: Option<PersistenceSection>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub rate_limit: RateLimitSection,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub auth: AuthSection,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct RateLimitSection {
+    #[serde(default = "default_rate_limit_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_requests_per_second")]
+    pub requests_per_second: u32,
+    #[serde(default = "default_burst_size")]
+    pub burst_size: u32,
+}
+
+impl Default for RateLimitSection {
+    fn default() -> Self {
+        RateLimitSection {
+            enabled: default_rate_limit_enabled(),
+            requests_per_second: default_requests_per_second(),
+            burst_size: default_burst_size(),
+        }
+    }
+}
+
+fn default_rate_limit_enabled() -> bool {
+    true
+}
+
+fn default_requests_per_second() -> u32 {
+    100
+}
+
+fn default_burst_size() -> u32 {
+    200
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct AuthSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -89,6 +137,15 @@ pub struct ServerSection {
     pub rest_port: u16,
     #[serde(default = "default_tcp_port")]
     pub tcp_port: u16,
+    #[serde(default = "default_max_ws_connections")]
+    #[allow(dead_code)]
+    pub max_ws_connections: u64,
+    #[serde(default = "default_max_tcp_connections")]
+    #[allow(dead_code)]
+    pub max_tcp_connections: u64,
+    #[serde(default = "default_shutdown_timeout_secs")]
+    #[allow(dead_code)]
+    pub shutdown_timeout_secs: u64,
 }
 
 #[allow(dead_code)]
@@ -144,6 +201,18 @@ fn default_rest_port() -> u16 {
 
 fn default_tcp_port() -> u16 {
     8082
+}
+
+fn default_max_ws_connections() -> u64 {
+    1000
+}
+
+fn default_max_tcp_connections() -> u64 {
+    500
+}
+
+fn default_shutdown_timeout_secs() -> u64 {
+    5
 }
 
 fn default_min_qty() -> String {

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -14,6 +15,7 @@ use tachyon_engine::Command;
 
 use crate::bridge::EngineBridge;
 use crate::types::*;
+use crate::MetricsProvider;
 
 /// Shared application state for all REST handlers.
 #[derive(Clone)]
@@ -27,10 +29,21 @@ pub struct AppState {
     /// Maps order_id -> symbol for cancel routing.
     pub order_registry: Arc<RwLock<HashMap<u64, Symbol>>>,
     pub start_time: Instant,
+    /// Per-symbol engine alive flags (set to false if engine thread exits).
+    pub engine_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
+    /// Global request ID counter for tracing.
+    pub request_id_counter: Arc<AtomicU64>,
+    /// Metrics provider for `/metrics` and `/api/v1/metrics` endpoints.
+    pub metrics: Option<Arc<dyn MetricsProvider>>,
+    /// List of configured symbol names for the status endpoint.
+    pub symbol_names: Arc<Vec<String>>,
 }
 
 /// Maximum number of recent trades returned per query.
 const MAX_RECENT_TRADES: usize = 100;
+
+/// Maximum request body size (1 MB).
+const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 /// Creates the REST API router.
 pub fn rest_router(state: AppState) -> Router {
@@ -40,7 +53,11 @@ pub fn rest_router(state: AppState) -> Router {
         .route("/api/v1/order", post(place_order))
         .route("/api/v1/order/:id", delete(cancel_order))
         .route("/api/v1/symbols", get(list_symbols))
+        .route("/api/v1/metrics", get(get_metrics_json))
+        .route("/api/v1/status", get(get_status))
+        .route("/metrics", get(get_metrics_prometheus))
         .route("/health", get(health_check))
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }
 
@@ -49,13 +66,17 @@ async fn place_order(
     State(state): State<AppState>,
     Json(req): Json<PlaceOrderRequest>,
 ) -> impl IntoResponse {
+    // Generate request ID for tracing
+    let request_id = state.request_id_counter.fetch_add(1, Ordering::Relaxed);
+
     // Resolve symbol
     let symbol = match state.symbol_registry.get(&req.symbol) {
         Some(s) => *s,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "unknown symbol"})),
+                [("x-request-id", request_id.to_string())],
+                Json(serde_json::json!({"error": "unknown symbol", "request_id": request_id})),
             )
                 .into_response();
         }
@@ -66,6 +87,7 @@ async fn place_order(
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!({"error": "symbol config not found"})),
             )
                 .into_response();
@@ -79,6 +101,7 @@ async fn place_order(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!({"error": "invalid side, expected 'buy' or 'sell'"})),
             )
                 .into_response();
@@ -92,6 +115,7 @@ async fn place_order(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!({"error": "invalid order_type, expected 'limit' or 'market'"})),
             )
                 .into_response();
@@ -107,6 +131,7 @@ async fn place_order(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!({"error": "invalid time_in_force"})),
             )
                 .into_response();
@@ -118,6 +143,7 @@ async fn place_order(
         Some(0) => {
             return (
                 StatusCode::BAD_REQUEST,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!({"error": "quantity must be greater than zero"})),
             )
                 .into_response();
@@ -126,11 +152,35 @@ async fn place_order(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!({"error": "invalid quantity"})),
             )
                 .into_response();
         }
     };
+
+    // Validate quantity against symbol limits
+    let qty = Quantity::new(qty_raw);
+    if qty < config.min_order_qty {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("x-request-id", request_id.to_string())],
+            Json(serde_json::json!({
+                "error": format!("quantity below minimum ({})", format_qty(config.min_order_qty, config.qty_scale))
+            })),
+        )
+            .into_response();
+    }
+    if qty > config.max_order_qty {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("x-request-id", request_id.to_string())],
+            Json(serde_json::json!({
+                "error": format!("quantity exceeds maximum ({})", format_qty(config.max_order_qty, config.qty_scale))
+            })),
+        )
+            .into_response();
+    }
 
     // Parse price
     let price_raw = if order_type == OrderType::Market {
@@ -144,15 +194,41 @@ async fn place_order(
                 Some(0) => {
                     return (
                         StatusCode::BAD_REQUEST,
+                        [("x-request-id", request_id.to_string())],
                         Json(serde_json::json!({"error": "price must be greater than zero"})),
                     )
                         .into_response();
                 }
                 Some(v) => match i64::try_from(v) {
-                    Ok(v) => v,
+                    Ok(v) => {
+                        // Validate price against symbol limits
+                        let price = Price::new(v);
+                        if price < config.min_price {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                [("x-request-id", request_id.to_string())],
+                                Json(serde_json::json!({
+                                    "error": format!("price below minimum ({})", format_price(config.min_price, config.price_scale))
+                                })),
+                            )
+                                .into_response();
+                        }
+                        if price > config.max_price {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                [("x-request-id", request_id.to_string())],
+                                Json(serde_json::json!({
+                                    "error": format!("price exceeds maximum ({})", format_price(config.max_price, config.price_scale))
+                                })),
+                            )
+                                .into_response();
+                        }
+                        v
+                    }
                     Err(_) => {
                         return (
                             StatusCode::BAD_REQUEST,
+                            [("x-request-id", request_id.to_string())],
                             Json(serde_json::json!({"error": "price value overflow"})),
                         )
                             .into_response();
@@ -161,6 +237,7 @@ async fn place_order(
                 None => {
                     return (
                         StatusCode::BAD_REQUEST,
+                        [("x-request-id", request_id.to_string())],
                         Json(serde_json::json!({"error": "invalid price"})),
                     )
                         .into_response();
@@ -169,6 +246,7 @@ async fn place_order(
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
+                    [("x-request-id", request_id.to_string())],
                     Json(serde_json::json!({"error": "price required for limit orders"})),
                 )
                     .into_response();
@@ -217,12 +295,14 @@ async fn place_order(
 
             (
                 StatusCode::OK,
+                [("x-request-id", request_id.to_string())],
                 Json(serde_json::json!(PlaceOrderResponse { order_id, status })),
             )
                 .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            [("x-request-id", request_id.to_string())],
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
@@ -350,12 +430,122 @@ async fn list_symbols(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Health check endpoint.
+///
+/// Returns "ok" if all engine threads are alive, "degraded" if any have stopped.
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
-    let response = HealthResponse {
-        status: "ok".to_string(),
-        uptime_secs: uptime,
+
+    let mut all_alive = true;
+    let mut engine_statuses = Vec::new();
+
+    for (name, alive_flag) in state.engine_alive.iter() {
+        let alive = alive_flag.load(Ordering::Relaxed);
+        if !alive {
+            all_alive = false;
+        }
+        engine_statuses.push(EngineStatus {
+            symbol: name.clone(),
+            alive,
+        });
+    }
+    // Sort for deterministic output
+    engine_statuses.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+
+    let status = if all_alive { "ok" } else { "degraded" };
+
+    let engines = if engine_statuses.is_empty() {
+        None
+    } else {
+        Some(engine_statuses)
     };
+
+    let response = HealthResponse {
+        status: status.to_string(),
+        uptime_secs: uptime,
+        engines,
+    };
+
+    let status_code = if all_alive {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status_code, Json(serde_json::json!(response))).into_response()
+}
+
+/// `GET /metrics` -- Prometheus text exposition format.
+async fn get_metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
+    match &state.metrics {
+        Some(provider) => {
+            let body = provider.encode_prometheus();
+            (
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "metrics not configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/metrics` -- JSON format with all metrics.
+async fn get_metrics_json(State(state): State<AppState>) -> impl IntoResponse {
+    match &state.metrics {
+        Some(provider) => {
+            let body = provider.encode_json();
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "metrics not configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/status` -- Server status: uptime, version, symbols, connections.
+async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
+    let uptime = match &state.metrics {
+        Some(provider) => provider.uptime_secs(),
+        None => state.start_time.elapsed().as_secs(),
+    };
+
+    let (ws_active, tcp_active) = match &state.metrics {
+        Some(provider) => {
+            let json_str = provider.encode_json();
+            let val: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+            let ws = val["ws_connections_active"].as_i64().unwrap_or(0);
+            let tcp = val["tcp_connections_active"].as_i64().unwrap_or(0);
+            (ws, tcp)
+        }
+        None => (0, 0),
+    };
+
+    let mut symbols = state.symbol_names.as_ref().clone();
+    symbols.sort();
+
+    let response = StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs: uptime,
+        symbols,
+        ws_connections_active: ws_active,
+        tcp_connections_active: tcp_active,
+    };
+
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -445,6 +635,9 @@ mod tests {
             },
         );
 
+        let mut engine_alive = HashMap::new();
+        engine_alive.insert("BTCUSDT".to_string(), Arc::new(AtomicBool::new(true)));
+
         AppState {
             bridge: Arc::new(bridge),
             symbol_registry: Arc::new(symbol_registry),
@@ -453,6 +646,28 @@ mod tests {
             book_snapshots: Arc::new(RwLock::new(HashMap::new())),
             order_registry: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
+            engine_alive: Arc::new(engine_alive),
+            request_id_counter: Arc::new(AtomicU64::new(1)),
+            metrics: None,
+            symbol_names: Arc::new(vec!["BTCUSDT".to_string()]),
+        }
+    }
+
+    /// A simple test metrics provider for unit tests.
+    struct TestMetricsProvider;
+
+    impl MetricsProvider for TestMetricsProvider {
+        fn encode_prometheus(&self) -> String {
+            "# HELP tachyon_trades_total Total trades\n# TYPE tachyon_trades_total counter\ntachyon_trades_total 42\n".to_string()
+        }
+
+        fn encode_json(&self) -> String {
+            r#"{"trades_total":42,"ws_connections_active":3,"tcp_connections_active":1}"#
+                .to_string()
+        }
+
+        fn uptime_secs(&self) -> u64 {
+            120
         }
     }
 
@@ -472,6 +687,34 @@ mod tests {
         let body = resp.into_body().collect().await.expect("body").to_bytes();
         let parsed: HealthResponse = serde_json::from_slice(&body).expect("parse");
         assert_eq!(parsed.status, "ok");
+        // Should include engine status
+        assert!(parsed.engines.is_some());
+        let engines = parsed.engines.unwrap();
+        assert_eq!(engines.len(), 1);
+        assert_eq!(engines[0].symbol, "BTCUSDT");
+        assert!(engines[0].alive);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_degraded() {
+        let state = test_state();
+        // Simulate engine thread death
+        if let Some(alive) = state.engine_alive.get("BTCUSDT") {
+            alive.store(false, Ordering::Relaxed);
+        }
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let parsed: HealthResponse = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(parsed.status, "degraded");
     }
 
     #[tokio::test]
@@ -609,5 +852,100 @@ mod tests {
         assert_eq!(format_qty(Quantity::new(150), 2), "1.50");
         assert_eq!(format_qty(Quantity::new(100), 0), "100");
         assert_eq!(format_qty(Quantity::new(1), 4), "0.0001");
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_prometheus() {
+        let mut state = test_state();
+        state.metrics = Some(Arc::new(TestMetricsProvider));
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("tachyon_trades_total 42"));
+        assert!(text.contains("# TYPE tachyon_trades_total counter"));
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_prometheus_not_configured() {
+        let state = test_state();
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_json() {
+        let mut state = test_state();
+        state.metrics = Some(Arc::new(TestMetricsProvider));
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/metrics")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(val["trades_total"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_get_status() {
+        let mut state = test_state();
+        state.metrics = Some(Arc::new(TestMetricsProvider));
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/status")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let parsed: StatusResponse = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(parsed.uptime_secs, 120);
+        assert_eq!(parsed.symbols, vec!["BTCUSDT"]);
+        assert_eq!(parsed.ws_connections_active, 3);
+        assert_eq!(parsed.tcp_connections_active, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_status_without_metrics() {
+        let state = test_state();
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/status")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let parsed: StatusResponse = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(parsed.symbols, vec!["BTCUSDT"]);
+        assert_eq!(parsed.ws_connections_active, 0);
+        assert_eq!(parsed.tcp_connections_active, 0);
     }
 }

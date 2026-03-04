@@ -26,6 +26,10 @@ pub struct TcpState {
     pub bridge: Arc<EngineBridge>,
     /// Atomic sequence counter for outbound server messages.
     pub seq_counter: Arc<AtomicU64>,
+    /// Current number of active TCP connections.
+    pub active_connections: Arc<AtomicU64>,
+    /// Maximum allowed TCP connections (0 = unlimited).
+    pub max_connections: u64,
 }
 
 /// Starts the TCP binary protocol server.
@@ -37,10 +41,30 @@ pub async fn run_tcp_server(listener: TcpListener, state: TcpState) {
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                // Check connection limit
+                if state.max_connections > 0 {
+                    let current = state.active_connections.load(Ordering::Relaxed);
+                    if current >= state.max_connections {
+                        tracing::warn!(
+                            peer = %addr,
+                            current,
+                            max = state.max_connections,
+                            "TCP connection rejected: limit reached"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                }
+
+                state.active_connections.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(peer = %addr, "TCP binary client connected");
+
                 let conn_state = state.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, conn_state).await;
+                    handle_connection(stream, conn_state.clone()).await;
+                    conn_state
+                        .active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
                     tracing::info!(peer = %addr, "TCP binary client disconnected");
                 });
             }
@@ -214,6 +238,8 @@ mod tests {
         let state = TcpState {
             bridge: Arc::new(bridge),
             seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
         };
 
         // Bind TCP listener on an ephemeral port
@@ -300,6 +326,8 @@ mod tests {
         let state = TcpState {
             bridge: Arc::new(bridge),
             seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -344,6 +372,8 @@ mod tests {
         let state = TcpState {
             bridge: Arc::new(bridge),
             seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -412,6 +442,8 @@ mod tests {
         let state = TcpState {
             bridge: Arc::new(bridge),
             seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -510,5 +542,56 @@ mod tests {
             }
             other => panic!("Expected Trade, got {:?}", other),
         }
+    }
+
+    /// Test connection limits: reject when at max.
+    #[tokio::test]
+    async fn test_tcp_connection_limit() {
+        let (bridge, _queues) = EngineBridge::new(&[0], 16);
+        let state = TcpState {
+            bridge: Arc::new(bridge),
+            seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 1,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            run_tcp_server(listener, state).await;
+        });
+
+        // First connection should succeed
+        let conn1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Give the server a moment to register the connection
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Second connection: the server should drop it immediately
+        let conn2 = tokio::net::TcpStream::connect(addr).await;
+        if let Ok(mut stream2) = conn2 {
+            // The server accepted the TCP socket at OS level but drops it immediately.
+            // We should see the stream close (read returns 0 or error).
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut buf = vec![0u8; 16];
+            let result = stream2.read(&mut buf).await;
+            match result {
+                Ok(0) => {} // Connection closed as expected
+                Ok(_) => panic!("Expected connection to be closed by server"),
+                Err(_) => {} // Also acceptable -- connection reset
+            }
+        }
+
+        // Drop first connection to free up the slot
+        drop(conn1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Third connection should now succeed since the slot is free
+        let conn3 = tokio::net::TcpStream::connect(addr).await;
+        assert!(
+            conn3.is_ok(),
+            "Third connection should succeed after first was dropped"
+        );
     }
 }
