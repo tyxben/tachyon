@@ -17,3 +17,4 @@ bincode = "1"
 [dev-dependencies]
 tempfile = "3"
 tachyon-book = { path = "../tachyon-book" }
+tachyon-engine = { path = "../tachyon-engine" }

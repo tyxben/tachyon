@@ -13,7 +13,7 @@ pub mod ws;
 
 pub use auth::{auth_middleware, AuthConfig, AuthState};
 pub use bridge::EngineBridge;
-pub use rate_limit::{RateLimitConfig, RateLimiter};
+pub use rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 pub use rest::{rest_router, AppState};
 pub use tcp::{run_tcp_server, TcpState};
 pub use types::*;

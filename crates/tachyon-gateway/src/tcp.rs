@@ -3,6 +3,7 @@
 //! Accepts TCP connections, decodes binary-framed messages using `tachyon_proto::ServerCodec`,
 //! routes commands through the existing `EngineBridge`, and sends encoded responses back.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -10,7 +11,6 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 
-use tachyon_core::Symbol;
 use tachyon_engine::Command;
 use tachyon_proto::msg::{engine_event_to_server_msg, new_order_to_core};
 use tachyon_proto::{
@@ -30,6 +30,8 @@ pub struct TcpState {
     pub active_connections: Arc<AtomicU64>,
     /// Maximum allowed TCP connections (0 = unlimited).
     pub max_connections: u64,
+    /// Maps order_id -> symbol for cancel/modify routing (shared with REST).
+    pub order_registry: Arc<std::sync::RwLock<HashMap<u64, tachyon_core::Symbol>>>,
 }
 
 /// Starts the TCP binary protocol server.
@@ -41,22 +43,23 @@ pub async fn run_tcp_server(listener: TcpListener, state: TcpState) {
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                // Check connection limit
+                // Atomic increment-then-check to avoid TOCTOU race on connection limits.
                 if state.max_connections > 0 {
-                    let current = state.active_connections.load(Ordering::Relaxed);
-                    if current >= state.max_connections {
+                    let prev = state.active_connections.fetch_add(1, Ordering::AcqRel);
+                    if prev >= state.max_connections {
+                        state.active_connections.fetch_sub(1, Ordering::AcqRel);
                         tracing::warn!(
                             peer = %addr,
-                            current,
+                            current = prev,
                             max = state.max_connections,
                             "TCP connection rejected: limit reached"
                         );
                         drop(stream);
                         continue;
                     }
+                } else {
+                    state.active_connections.fetch_add(1, Ordering::Relaxed);
                 }
-
-                state.active_connections.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(peer = %addr, "TCP binary client connected");
 
                 let conn_state = state.clone();
@@ -144,10 +147,30 @@ async fn process_client_frame(
 
         ClientMessage::CancelOrder(ProtoCancelOrder {
             order_id,
-            symbol_id,
+            symbol_id: _,
         }) => {
-            let symbol = Symbol::new(symbol_id);
             let oid = tachyon_core::OrderId::new(order_id);
+
+            // Look up the correct symbol from order_registry instead of
+            // trusting the client-supplied symbol_id.
+            let symbol = {
+                let registry = state.order_registry.read().unwrap();
+                registry.get(&order_id).copied()
+            };
+
+            let symbol = match symbol {
+                Some(s) => s,
+                None => {
+                    return vec![Frame {
+                        seq_num: next_seq(&state.seq_counter),
+                        message: ServerMessage::OrderRejected(tachyon_proto::OrderRejected {
+                            order_id,
+                            reason: tachyon_proto::msg::REJECT_UNKNOWN,
+                            timestamp: current_timestamp(),
+                        }),
+                    }];
+                }
+            };
 
             match state.bridge.send_cancel(oid, symbol, 0).await {
                 Ok(events) => events_to_frames(events, &state.seq_counter),
@@ -160,11 +183,31 @@ async fn process_client_frame(
 
         ClientMessage::ModifyOrder(ProtoModifyOrder {
             order_id,
-            symbol_id,
+            symbol_id: _,
             new_price,
             new_quantity,
         }) => {
-            let symbol = Symbol::new(symbol_id);
+            // Look up the correct symbol from order_registry instead of
+            // trusting the client-supplied symbol_id.
+            let symbol = {
+                let registry = state.order_registry.read().unwrap();
+                registry.get(&order_id).copied()
+            };
+
+            let symbol = match symbol {
+                Some(s) => s,
+                None => {
+                    return vec![Frame {
+                        seq_num: next_seq(&state.seq_counter),
+                        message: ServerMessage::OrderRejected(tachyon_proto::OrderRejected {
+                            order_id,
+                            reason: tachyon_proto::msg::REJECT_UNKNOWN,
+                            timestamp: current_timestamp(),
+                        }),
+                    }];
+                }
+            };
+
             let command = Command::ModifyOrder {
                 order_id: tachyon_core::OrderId::new(order_id),
                 new_price: Some(tachyon_core::Price::new(new_price)),
@@ -222,12 +265,17 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
     use tachyon_proto::msg::*;
     use tachyon_proto::ClientCodec;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_util::bytes::BytesMut;
     use tokio_util::codec::{Decoder, Encoder};
+
+    fn empty_order_registry() -> Arc<RwLock<HashMap<u64, tachyon_core::Symbol>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     /// Integration test: send a binary NewOrder over TCP, receive OrderAccepted/Trade responses.
     #[tokio::test]
@@ -240,6 +288,7 @@ mod tests {
             seq_counter: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicU64::new(0)),
             max_connections: 0,
+            order_registry: empty_order_registry(),
         };
 
         // Bind TCP listener on an ephemeral port
@@ -263,6 +312,7 @@ mod tests {
                 side: SIDE_BUY,
                 order_type: ORDER_TYPE_LIMIT,
                 time_in_force: TIF_GTC,
+                gtd_timestamp: 0,
                 symbol_id: 0,
                 price: 10000,
                 quantity: 100,
@@ -328,6 +378,7 @@ mod tests {
             seq_counter: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicU64::new(0)),
             max_connections: 0,
+            order_registry: empty_order_registry(),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -369,11 +420,18 @@ mod tests {
     async fn test_tcp_binary_cancel_order_integration() {
         let (bridge, engine_queues) = EngineBridge::new(&[0], 16);
         let q = engine_queues.get(&0).unwrap().clone();
+        let order_registry = empty_order_registry();
+        // Pre-register order 99 with symbol 0 so the cancel handler can find it.
+        order_registry
+            .write()
+            .unwrap()
+            .insert(99, tachyon_core::Symbol::new(0));
         let state = TcpState {
             bridge: Arc::new(bridge),
             seq_counter: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicU64::new(0)),
             max_connections: 0,
+            order_registry,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -444,6 +502,7 @@ mod tests {
             seq_counter: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicU64::new(0)),
             max_connections: 0,
+            order_registry: empty_order_registry(),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -463,6 +522,7 @@ mod tests {
                 side: SIDE_BUY,
                 order_type: ORDER_TYPE_LIMIT,
                 time_in_force: TIF_GTC,
+                gtd_timestamp: 0,
                 symbol_id: 0,
                 price: 10000,
                 quantity: 100,
@@ -553,6 +613,7 @@ mod tests {
             seq_counter: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicU64::new(0)),
             max_connections: 1,
+            order_registry: empty_order_registry(),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -593,5 +654,120 @@ mod tests {
             conn3.is_ok(),
             "Third connection should succeed after first was dropped"
         );
+    }
+
+    /// Test that TCP cancel for an order not in the registry gets rejected.
+    #[tokio::test]
+    async fn test_tcp_cancel_unknown_order_rejected() {
+        let (bridge, _engine_queues) = EngineBridge::new(&[0], 16);
+        // Order registry is empty -- order 999 is not registered
+        let state = TcpState {
+            bridge: Arc::new(bridge),
+            seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
+            order_registry: empty_order_registry(),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            run_tcp_server(listener, state).await;
+        });
+
+        let mut client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = client_stream.set_nodelay(true);
+
+        // Send CancelOrder for an order that does not exist in the registry
+        let cancel_frame = Frame {
+            seq_num: 1,
+            message: ClientMessage::CancelOrder(ProtoCancelOrder {
+                order_id: 999,
+                symbol_id: 0, // Client claims symbol 0, but order is not registered
+            }),
+        };
+        let mut client_codec = ClientCodec;
+        let mut wire_buf = BytesMut::new();
+        client_codec.encode(cancel_frame, &mut wire_buf).unwrap();
+        client_stream.write_all(&wire_buf).await.unwrap();
+
+        // Read the response -- should be OrderRejected
+        let mut resp_buf = vec![0u8; 256];
+        let n = client_stream.read(&mut resp_buf).await.unwrap();
+        assert!(n > 0);
+
+        let mut decode_buf = BytesMut::from(&resp_buf[..n]);
+        let mut client_decoder = ClientCodec;
+        let frame = client_decoder
+            .decode(&mut decode_buf)
+            .unwrap()
+            .expect("should decode response");
+
+        match frame.message {
+            ServerMessage::OrderRejected(rejected) => {
+                assert_eq!(rejected.order_id, 999);
+                assert_eq!(rejected.reason, REJECT_UNKNOWN);
+            }
+            other => panic!("Expected OrderRejected, got {:?}", other),
+        }
+    }
+
+    /// Test that TCP modify for an order not in the registry gets rejected.
+    #[tokio::test]
+    async fn test_tcp_modify_unknown_order_rejected() {
+        let (bridge, _engine_queues) = EngineBridge::new(&[0], 16);
+        let state = TcpState {
+            bridge: Arc::new(bridge),
+            seq_counter: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicU64::new(0)),
+            max_connections: 0,
+            order_registry: empty_order_registry(),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            run_tcp_server(listener, state).await;
+        });
+
+        let mut client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = client_stream.set_nodelay(true);
+
+        // Send ModifyOrder for an order not in the registry
+        let modify_frame = Frame {
+            seq_num: 1,
+            message: ClientMessage::ModifyOrder(ProtoModifyOrder {
+                order_id: 888,
+                symbol_id: 0,
+                new_price: 12345,
+                new_quantity: 50,
+            }),
+        };
+        let mut client_codec = ClientCodec;
+        let mut wire_buf = BytesMut::new();
+        client_codec.encode(modify_frame, &mut wire_buf).unwrap();
+        client_stream.write_all(&wire_buf).await.unwrap();
+
+        // Read the response -- should be OrderRejected
+        let mut resp_buf = vec![0u8; 256];
+        let n = client_stream.read(&mut resp_buf).await.unwrap();
+        assert!(n > 0);
+
+        let mut decode_buf = BytesMut::from(&resp_buf[..n]);
+        let mut client_decoder = ClientCodec;
+        let frame = client_decoder
+            .decode(&mut decode_buf)
+            .unwrap()
+            .expect("should decode response");
+
+        match frame.message {
+            ServerMessage::OrderRejected(rejected) => {
+                assert_eq!(rejected.order_id, 888);
+                assert_eq!(rejected.reason, REJECT_UNKNOWN);
+            }
+            other => panic!("Expected OrderRejected, got {:?}", other),
+        }
     }
 }

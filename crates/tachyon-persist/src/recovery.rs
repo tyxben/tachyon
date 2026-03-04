@@ -27,10 +27,19 @@ impl From<bincode::Error> for RecoveryError {
 
 pub type Result<T> = std::result::Result<T, RecoveryError>;
 
+/// Per-symbol engine state recovered from a snapshot.
+pub struct RecoveredSymbolState {
+    pub config: SymbolConfig,
+    pub orders: Vec<Order>,
+    pub next_order_id: u64,
+    pub sequence: u64,
+    pub trade_id_counter: u64,
+}
+
 /// Recovered state: symbol configs, orders, and replay metadata.
 pub struct RecoveryState {
-    /// Per-symbol state: (config, orders).
-    pub snapshots: HashMap<Symbol, (SymbolConfig, Vec<Order>)>,
+    /// Per-symbol state recovered from snapshot.
+    pub snapshots: HashMap<Symbol, RecoveredSymbolState>,
     /// Sequence number of the last successfully recovered entry.
     pub last_sequence: u64,
     /// Number of WAL events replayed after the snapshot.
@@ -74,9 +83,16 @@ impl RecoveryManager {
                     );
                     state.last_sequence = snap.sequence;
                     for sym_snap in snap.symbols {
-                        state
-                            .snapshots
-                            .insert(sym_snap.symbol, (sym_snap.config, sym_snap.orders));
+                        state.snapshots.insert(
+                            sym_snap.symbol,
+                            RecoveredSymbolState {
+                                config: sym_snap.config,
+                                orders: sym_snap.orders,
+                                next_order_id: sym_snap.next_order_id,
+                                sequence: sym_snap.sequence,
+                                trade_id_counter: sym_snap.trade_id_counter,
+                            },
+                        );
                     }
                 }
                 Err(e) => {
@@ -200,6 +216,9 @@ mod tests {
                     prev: NO_LINK,
                     next: NO_LINK,
                 }],
+                next_order_id: 2,
+                sequence: seq,
+                trade_id_counter: 0,
             }],
         }
     }
@@ -219,10 +238,10 @@ mod tests {
         assert_eq!(state.last_sequence, 100);
         assert_eq!(state.events_replayed, 0);
         assert!(state.snapshots.contains_key(&Symbol::new(0)));
-        let (config, orders) = &state.snapshots[&Symbol::new(0)];
-        assert_eq!(config.price_scale, 2);
-        assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].id, OrderId::new(1));
+        let sym_state = &state.snapshots[&Symbol::new(0)];
+        assert_eq!(sym_state.config.price_scale, 2);
+        assert_eq!(sym_state.orders.len(), 1);
+        assert_eq!(sym_state.orders[0].id, OrderId::new(1));
     }
 
     #[test]
@@ -459,6 +478,9 @@ mod tests {
                 symbol: Symbol::new(0),
                 config: config.clone(),
                 orders: orders.clone(),
+                next_order_id: 4,
+                sequence: 50,
+                trade_id_counter: 0,
             }],
         };
 
@@ -482,10 +504,10 @@ mod tests {
         assert_eq!(state.events_replayed, 10); // entries 51-60
 
         // Rebuild the order book from recovered state
-        let (recovered_config, recovered_orders) = &state.snapshots[&Symbol::new(0)];
-        let mut book = OrderBook::new(Symbol::new(0), recovered_config.clone());
+        let sym_state = &state.snapshots[&Symbol::new(0)];
+        let mut book = OrderBook::new(Symbol::new(0), sym_state.config.clone());
 
-        for order in recovered_orders {
+        for order in &sym_state.orders {
             book.restore_order(order.clone()).expect("restore");
         }
 
@@ -558,6 +580,9 @@ mod tests {
                 symbol: Symbol::new(0),
                 config: config.clone(),
                 orders: all_orders,
+                next_order_id: 6,
+                sequence: 100,
+                trade_id_counter: 0,
             }],
         };
 
@@ -638,9 +663,9 @@ mod tests {
         assert!(state.wal_events.is_empty());
 
         // Rebuild from snapshot
-        let (config, orders) = &state.snapshots[&Symbol::new(0)];
-        let mut book = OrderBook::new(Symbol::new(0), config.clone());
-        for order in orders {
+        let sym_state = &state.snapshots[&Symbol::new(0)];
+        let mut book = OrderBook::new(Symbol::new(0), sym_state.config.clone());
+        for order in &sym_state.orders {
             book.restore_order(order.clone()).expect("restore");
         }
 
@@ -648,5 +673,493 @@ mod tests {
         let o = book.get_order(OrderId::new(1)).expect("order");
         assert_eq!(o.price, Price::new(50000));
         assert_eq!(o.remaining_qty, Quantity::new(100));
+    }
+
+    /// Test C3 fix: WAL events after snapshot are correctly replayed into the book.
+    ///
+    /// Scenario: snapshot has 2 orders, WAL adds 1 more order and cancels 1.
+    /// After recovery + replay, the book should have 2 orders (original minus cancelled + new).
+    #[test]
+    fn test_recovery_wal_replay_into_book() {
+        use tachyon_book::OrderBook;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+
+        let config = SymbolConfig {
+            symbol: Symbol::new(0),
+            tick_size: Price::new(1),
+            lot_size: Quantity::new(1),
+            price_scale: 2,
+            qty_scale: 8,
+            max_price: Price::new(1_000_000),
+            min_price: Price::new(1),
+            max_order_qty: Quantity::new(1_000_000),
+            min_order_qty: Quantity::new(1),
+        };
+
+        // Snapshot with 2 orders at sequence 10
+        let snapshot = Snapshot {
+            sequence: 10,
+            timestamp: 10_000_000,
+            symbols: vec![SymbolSnapshot {
+                symbol: Symbol::new(0),
+                config: config.clone(),
+                orders: vec![
+                    Order {
+                        id: OrderId::new(1),
+                        symbol: Symbol::new(0),
+                        side: Side::Buy,
+                        price: Price::new(100),
+                        quantity: Quantity::new(50),
+                        remaining_qty: Quantity::new(50),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        timestamp: 1000,
+                        account_id: 1,
+                        prev: NO_LINK,
+                        next: NO_LINK,
+                    },
+                    Order {
+                        id: OrderId::new(2),
+                        symbol: Symbol::new(0),
+                        side: Side::Sell,
+                        price: Price::new(200),
+                        quantity: Quantity::new(100),
+                        remaining_qty: Quantity::new(100),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        timestamp: 2000,
+                        account_id: 2,
+                        prev: NO_LINK,
+                        next: NO_LINK,
+                    },
+                ],
+                next_order_id: 3,
+                sequence: 10,
+                trade_id_counter: 0,
+            }],
+        };
+
+        SnapshotWriter::write(&snap_dir, &snapshot).expect("write snapshot");
+
+        // WAL events after the snapshot:
+        // seq 11: new order accepted (order 3)
+        // seq 12: order 1 cancelled
+        {
+            let mut writer =
+                WalWriter::new(&wal_dir, 1024 * 1024, FsyncStrategy::Sync).expect("writer");
+
+            let event_11 = EngineEvent::OrderAccepted {
+                order_id: OrderId::new(3),
+                symbol: Symbol::new(0),
+                side: Side::Buy,
+                price: Price::new(150),
+                qty: Quantity::new(75),
+                timestamp: 3000,
+            };
+            writer.append(11, &event_11).expect("append 11");
+
+            let event_12 = EngineEvent::OrderCancelled {
+                order_id: OrderId::new(1),
+                remaining_qty: Quantity::new(50),
+                timestamp: 4000,
+            };
+            writer.append(12, &event_12).expect("append 12");
+
+            writer.flush().expect("flush");
+        }
+
+        // Recover
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        assert_eq!(state.last_sequence, 12);
+        assert_eq!(state.events_replayed, 2);
+        assert_eq!(state.wal_events.len(), 2);
+
+        // Rebuild the book from snapshot
+        let sym_state = &state.snapshots[&Symbol::new(0)];
+        let mut book = OrderBook::new(Symbol::new(0), sym_state.config.clone());
+        for order in &sym_state.orders {
+            book.restore_order(order.clone()).expect("restore");
+        }
+
+        // Now replay WAL events
+        for (_seq, event) in &state.wal_events {
+            match event {
+                EngineEvent::OrderAccepted {
+                    order_id,
+                    symbol,
+                    side,
+                    price,
+                    qty,
+                    timestamp,
+                } => {
+                    let order = Order {
+                        id: *order_id,
+                        symbol: *symbol,
+                        side: *side,
+                        price: *price,
+                        quantity: *qty,
+                        remaining_qty: *qty,
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        timestamp: *timestamp,
+                        account_id: 0,
+                        prev: NO_LINK,
+                        next: NO_LINK,
+                    };
+                    let _ = book.restore_order(order);
+                }
+                EngineEvent::OrderCancelled { order_id, .. } => {
+                    let _ = book.cancel_order(*order_id);
+                }
+                _ => {}
+            }
+        }
+
+        // Verify: order 1 cancelled, order 2 still there, order 3 added
+        assert_eq!(book.order_count(), 2);
+        assert!(book.get_order(OrderId::new(1)).is_none()); // cancelled
+        assert!(book.get_order(OrderId::new(2)).is_some()); // from snapshot
+        let o3 = book.get_order(OrderId::new(3)).expect("order 3");
+        assert_eq!(o3.price, Price::new(150));
+        assert_eq!(o3.remaining_qty, Quantity::new(75));
+    }
+
+    /// Test C4 fix: next_order_id is preserved across snapshot/restore.
+    #[test]
+    fn test_snapshot_preserves_engine_counters() {
+        use tachyon_engine::{RiskConfig, StpMode, SymbolEngine};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+
+        let config = SymbolConfig {
+            symbol: Symbol::new(0),
+            tick_size: Price::new(1),
+            lot_size: Quantity::new(1),
+            price_scale: 2,
+            qty_scale: 8,
+            max_price: Price::new(1_000_000),
+            min_price: Price::new(1),
+            max_order_qty: Quantity::new(1_000_000),
+            min_order_qty: Quantity::new(1),
+        };
+
+        let risk = RiskConfig {
+            price_band_pct: 0,
+            max_order_qty: Quantity::new(1_000_000),
+        };
+
+        // Create engine and process some orders to advance counters
+        let mut engine = SymbolEngine::new(Symbol::new(0), config.clone(), StpMode::None, risk);
+
+        // Place 3 orders (auto-assigned IDs)
+        for i in 1..=3 {
+            let order = Order {
+                id: OrderId::new(0), // auto-assign
+                symbol: Symbol::new(0),
+                side: Side::Buy,
+                price: Price::new(100 - i as i64),
+                quantity: Quantity::new(10),
+                remaining_qty: Quantity::new(10),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: i * 1000,
+                account_id: 1,
+                prev: NO_LINK,
+                next: NO_LINK,
+            };
+            engine.process_command(tachyon_engine::Command::PlaceOrder(order), 1, i * 1000);
+        }
+
+        // Capture state
+        let snapshot_state = engine.snapshot_full_state();
+        assert!(snapshot_state.next_order_id > 3);
+        assert_eq!(snapshot_state.sequence, 3);
+
+        // Write snapshot
+        let sym_snapshot = SymbolSnapshot {
+            symbol: snapshot_state.symbol,
+            config: snapshot_state.config.clone(),
+            orders: snapshot_state.orders,
+            next_order_id: snapshot_state.next_order_id,
+            sequence: snapshot_state.sequence,
+            trade_id_counter: snapshot_state.trade_id_counter,
+        };
+        let snapshot = Snapshot {
+            sequence: 100,
+            timestamp: 100_000_000,
+            symbols: vec![sym_snapshot],
+        };
+        SnapshotWriter::write(&snap_dir, &snapshot).expect("write");
+
+        // Read it back
+        let loaded =
+            crate::snapshot::SnapshotReader::read(snap_dir.join("snapshot_100.bin")).expect("read");
+
+        let loaded_sym = &loaded.symbols[0];
+        assert_eq!(loaded_sym.next_order_id, snapshot_state.next_order_id);
+        assert_eq!(loaded_sym.sequence, snapshot_state.sequence);
+        assert_eq!(loaded_sym.trade_id_counter, snapshot_state.trade_id_counter);
+
+        // Create a new engine and restore
+        let mut engine2 = SymbolEngine::new(
+            Symbol::new(0),
+            config,
+            StpMode::None,
+            RiskConfig {
+                price_band_pct: 0,
+                max_order_qty: Quantity::new(1_000_000),
+            },
+        );
+
+        for order in &loaded_sym.orders {
+            engine2
+                .book_mut()
+                .restore_order(order.clone())
+                .expect("restore");
+        }
+        engine2.set_next_order_id(loaded_sym.next_order_id);
+        engine2.set_sequence(loaded_sym.sequence);
+        engine2.set_trade_id_counter(loaded_sym.trade_id_counter);
+
+        assert_eq!(engine2.next_order_id(), snapshot_state.next_order_id);
+        assert_eq!(engine2.sequence(), snapshot_state.sequence);
+        assert_eq!(engine2.trade_id_counter(), snapshot_state.trade_id_counter);
+
+        // Place another order with auto-assigned ID -- should not collide
+        let order = Order {
+            id: OrderId::new(0), // auto-assign
+            symbol: Symbol::new(0),
+            side: Side::Sell,
+            price: Price::new(200),
+            quantity: Quantity::new(10),
+            remaining_qty: Quantity::new(10),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: 10000,
+            account_id: 2,
+            prev: NO_LINK,
+            next: NO_LINK,
+        };
+        let events = engine2.process_command(tachyon_engine::Command::PlaceOrder(order), 2, 10000);
+
+        // Should be accepted (not rejected as duplicate)
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::OrderAccepted { .. })));
+    }
+
+    /// Test C3+C4 integration: full cycle of write -> snapshot -> more WAL -> crash -> recover.
+    #[test]
+    fn test_full_recovery_cycle_snapshot_plus_wal_replay() {
+        use tachyon_engine::{Command, RiskConfig, StpMode, SymbolEngine};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap_dir = dir.path().join("snapshots");
+        let wal_dir = dir.path().join("wal");
+
+        let config = SymbolConfig {
+            symbol: Symbol::new(0),
+            tick_size: Price::new(1),
+            lot_size: Quantity::new(1),
+            price_scale: 2,
+            qty_scale: 8,
+            max_price: Price::new(1_000_000),
+            min_price: Price::new(1),
+            max_order_qty: Quantity::new(1_000_000),
+            min_order_qty: Quantity::new(1),
+        };
+
+        let risk = RiskConfig {
+            price_band_pct: 0,
+            max_order_qty: Quantity::new(1_000_000),
+        };
+
+        // Phase 1: Build engine, place orders, take snapshot
+        let mut engine = SymbolEngine::new(Symbol::new(0), config.clone(), StpMode::None, risk);
+
+        let mut wal_writer =
+            WalWriter::new(&wal_dir, 1024 * 1024, FsyncStrategy::Sync).expect("wal writer");
+        let mut seq: u64 = 0;
+
+        // Place 3 buy orders
+        for i in 1..=3 {
+            let order = Order {
+                id: OrderId::new(i),
+                symbol: Symbol::new(0),
+                side: Side::Buy,
+                price: Price::new(100 - i as i64),
+                quantity: Quantity::new(i * 10),
+                remaining_qty: Quantity::new(i * 10),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: i * 1000,
+                account_id: 1,
+                prev: NO_LINK,
+                next: NO_LINK,
+            };
+            let events = engine.process_command(Command::PlaceOrder(order), 1, i * 1000);
+            for event in &events {
+                seq += 1;
+                wal_writer.append(seq, event).expect("wal append");
+            }
+        }
+
+        // Take snapshot at current sequence
+        let snap_state = engine.snapshot_full_state();
+        let sym_snapshot = SymbolSnapshot {
+            symbol: snap_state.symbol,
+            config: snap_state.config.clone(),
+            orders: snap_state.orders,
+            next_order_id: snap_state.next_order_id,
+            sequence: snap_state.sequence,
+            trade_id_counter: snap_state.trade_id_counter,
+        };
+        let snapshot = Snapshot {
+            sequence: seq,
+            timestamp: 99_000_000,
+            symbols: vec![sym_snapshot],
+        };
+        SnapshotWriter::write(&snap_dir, &snapshot).expect("write snapshot");
+
+        // Phase 2: More operations AFTER snapshot (these go to WAL only)
+        // Place 2 sell orders
+        for i in 4..=5 {
+            let order = Order {
+                id: OrderId::new(i),
+                symbol: Symbol::new(0),
+                side: Side::Sell,
+                price: Price::new(200 + i as i64),
+                quantity: Quantity::new(i * 10),
+                remaining_qty: Quantity::new(i * 10),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: i * 1000,
+                account_id: 2,
+                prev: NO_LINK,
+                next: NO_LINK,
+            };
+            let events = engine.process_command(Command::PlaceOrder(order), 2, i * 1000);
+            for event in &events {
+                seq += 1;
+                wal_writer.append(seq, event).expect("wal append");
+            }
+        }
+
+        // Cancel order 1
+        let cancel_events = engine.process_command(Command::CancelOrder(OrderId::new(1)), 1, 6000);
+        for event in &cancel_events {
+            seq += 1;
+            wal_writer.append(seq, event).expect("wal append");
+        }
+
+        wal_writer.flush().expect("flush");
+        drop(wal_writer);
+
+        // Verify pre-crash state
+        assert_eq!(engine.book().order_count(), 4); // orders 2,3,4,5 (1 cancelled)
+
+        // Phase 3: "Crash" and recover
+        let mgr = RecoveryManager::new(&snap_dir, &wal_dir);
+        let state = mgr.recover().expect("recover");
+
+        // The snapshot had 3 orders at the snapshot sequence.
+        // WAL events after snapshot should be present.
+        assert!(!state.wal_events.is_empty());
+
+        // Rebuild engine from recovery state
+        let sym_state = &state.snapshots[&Symbol::new(0)];
+        let mut recovered_engine = SymbolEngine::new(
+            Symbol::new(0),
+            sym_state.config.clone(),
+            StpMode::None,
+            RiskConfig {
+                price_band_pct: 0,
+                max_order_qty: Quantity::new(1_000_000),
+            },
+        );
+
+        // Restore snapshot orders
+        for order in &sym_state.orders {
+            recovered_engine
+                .book_mut()
+                .restore_order(order.clone())
+                .expect("restore");
+        }
+        recovered_engine.set_next_order_id(sym_state.next_order_id);
+        recovered_engine.set_sequence(sym_state.sequence);
+        recovered_engine.set_trade_id_counter(sym_state.trade_id_counter);
+
+        // Replay WAL events
+        for (_seq, event) in &state.wal_events {
+            match event {
+                EngineEvent::OrderAccepted {
+                    order_id,
+                    symbol,
+                    side,
+                    price,
+                    qty,
+                    timestamp,
+                } => {
+                    let order = Order {
+                        id: *order_id,
+                        symbol: *symbol,
+                        side: *side,
+                        price: *price,
+                        quantity: *qty,
+                        remaining_qty: *qty,
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        timestamp: *timestamp,
+                        account_id: 0,
+                        prev: NO_LINK,
+                        next: NO_LINK,
+                    };
+                    let _ = recovered_engine.book_mut().restore_order(order);
+                }
+                EngineEvent::OrderCancelled { order_id, .. } => {
+                    let _ = recovered_engine.book_mut().cancel_order(*order_id);
+                }
+                EngineEvent::Trade { trade } => {
+                    if let Some(maker) = recovered_engine.book().get_order(trade.maker_order_id) {
+                        let new_remaining = maker.remaining_qty.saturating_sub(trade.quantity);
+                        if new_remaining.is_zero() {
+                            let _ = recovered_engine
+                                .book_mut()
+                                .cancel_order(trade.maker_order_id);
+                        } else if let Some(existing) =
+                            recovered_engine.book().get_order(trade.maker_order_id)
+                        {
+                            let mut updated = existing.clone();
+                            updated.remaining_qty = new_remaining;
+                            let _ = recovered_engine
+                                .book_mut()
+                                .cancel_order(trade.maker_order_id);
+                            let _ = recovered_engine.book_mut().restore_order(updated);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Verify: recovered engine matches pre-crash state
+        assert_eq!(recovered_engine.book().order_count(), 4); // 2,3,4,5
+        assert!(recovered_engine.book().get_order(OrderId::new(1)).is_none()); // cancelled
+        assert!(recovered_engine.book().get_order(OrderId::new(2)).is_some());
+        assert!(recovered_engine.book().get_order(OrderId::new(3)).is_some());
+        assert!(recovered_engine.book().get_order(OrderId::new(4)).is_some());
+        assert!(recovered_engine.book().get_order(OrderId::new(5)).is_some());
+
+        // Verify order details
+        let o4 = recovered_engine.book().get_order(OrderId::new(4)).unwrap();
+        assert_eq!(o4.side, Side::Sell);
+        assert_eq!(o4.price, Price::new(204));
+        assert_eq!(o4.remaining_qty, Quantity::new(40));
     }
 }

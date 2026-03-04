@@ -1567,6 +1567,7 @@ dependencies = [
  "serde",
  "tachyon-book",
  "tachyon-core",
+ "tachyon-engine",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

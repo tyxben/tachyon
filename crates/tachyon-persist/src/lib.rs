@@ -7,7 +7,7 @@ pub mod recovery;
 pub mod snapshot;
 pub mod wal;
 
-pub use recovery::{RecoveryManager, RecoveryState};
+pub use recovery::{RecoveredSymbolState, RecoveryManager, RecoveryState};
 pub use snapshot::{Snapshot, SnapshotReader, SnapshotWriter, SymbolSnapshot};
 pub use wal::{WalEntry, WalReader, WalWriter};
 

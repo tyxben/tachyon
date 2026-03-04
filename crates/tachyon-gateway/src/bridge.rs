@@ -76,14 +76,18 @@ impl EngineBridge {
             response_tx: tx,
         };
 
-        // Spin-push: back-pressure if the SPSC queue is full.
+        // Spin-push with timeout: back-pressure if the SPSC queue is full.
         // In production the queue should be sized large enough that this rarely happens.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(100);
         let mut cmd = cmd;
         loop {
             match queue.try_push(cmd) {
                 Ok(()) => break,
                 Err(returned) => {
                     cmd = returned;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(BridgeError::QueueFull);
+                    }
                     // Yield to the tokio runtime so we don't block the executor.
                     tokio::task::yield_now().await;
                 }
@@ -112,6 +116,8 @@ pub enum BridgeError {
     UnknownSymbol,
     /// The engine dropped the response channel without sending a response.
     ResponseDropped,
+    /// The SPSC queue is full and the push timed out.
+    QueueFull,
 }
 
 impl std::fmt::Display for BridgeError {
@@ -119,6 +125,7 @@ impl std::fmt::Display for BridgeError {
         match self {
             BridgeError::UnknownSymbol => write!(f, "unknown symbol (no engine queue)"),
             BridgeError::ResponseDropped => write!(f, "engine response was dropped"),
+            BridgeError::QueueFull => write!(f, "engine queue full (backpressure timeout)"),
         }
     }
 }

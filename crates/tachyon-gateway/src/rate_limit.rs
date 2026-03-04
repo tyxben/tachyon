@@ -258,4 +258,71 @@ mod tests {
         limiter.cleanup_stale(0).await;
         assert_eq!(limiter.tracked_ips().await, 0);
     }
+
+    /// Integration test: rate_limit_middleware actually rejects excess requests.
+    #[tokio::test]
+    async fn test_rate_limit_middleware_rejects() {
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 2,
+        };
+        let limiter = RateLimiter::new(config);
+
+        let app = Router::new().route("/test", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(limiter, rate_limit_middleware),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // First two requests should succeed (burst_size = 2)
+        for i in 0..2 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let response = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                response.contains("200 OK"),
+                "Request {} should succeed, got: {}",
+                i,
+                response
+            );
+        }
+
+        // Third request should be rate limited (429)
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("429"),
+            "Third request should be rate limited, got: {}",
+            response
+        );
+    }
 }

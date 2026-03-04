@@ -12,6 +12,7 @@ pub enum RejectReason {
     SelfTradePrevented,
     PostOnlyWouldTake,
     DuplicateOrderId,
+    OrderNotFound,
 }
 
 /// Events emitted by the matching engine.
@@ -70,6 +71,7 @@ mod tests {
             RejectReason::SelfTradePrevented,
             RejectReason::PostOnlyWouldTake,
             RejectReason::DuplicateOrderId,
+            RejectReason::OrderNotFound,
         ];
         // Each variant should be distinct
         for (i, a) in reasons.iter().enumerate() {

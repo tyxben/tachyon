@@ -35,6 +35,7 @@ pub const TIF_GTC: u8 = 0;
 pub const TIF_IOC: u8 = 1;
 pub const TIF_FOK: u8 = 2;
 pub const TIF_POST_ONLY: u8 = 3;
+pub const TIF_GTD: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // Reject reason wire encoding
@@ -49,18 +50,24 @@ pub const REJECT_RATE_LIMIT: u8 = 5;
 pub const REJECT_SELF_TRADE: u8 = 6;
 pub const REJECT_POST_ONLY_WOULD_TAKE: u8 = 7;
 pub const REJECT_DUPLICATE_ORDER_ID: u8 = 8;
+pub const REJECT_ORDER_NOT_FOUND: u8 = 9;
 pub const REJECT_UNKNOWN: u8 = 0xFF;
 
 // ---------------------------------------------------------------------------
 // Client -> Server messages
 // ---------------------------------------------------------------------------
 
-/// NewOrder: side(1B) + order_type(1B) + tif(1B) + symbol_id(4B) + price(8B) + qty(8B) + account_id(8B) = 31 bytes
+/// NewOrder: side(1B) + order_type(1B) + tif(1B) + gtd_timestamp(8B) + symbol_id(4B) + price(8B) + qty(8B) + account_id(8B) = 39 bytes
+///
+/// The `gtd_timestamp` field holds the expiry timestamp (nanoseconds) for GTD orders,
+/// or 0 for all other TIF types. This keeps the message fixed-size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewOrder {
     pub side: u8,
     pub order_type: u8,
     pub time_in_force: u8,
+    /// GTD expiry timestamp in nanoseconds (0 for non-GTD orders).
+    pub gtd_timestamp: u64,
     pub symbol_id: u32,
     pub price: i64,
     pub quantity: u64,
@@ -68,7 +75,7 @@ pub struct NewOrder {
 }
 
 impl NewOrder {
-    pub const WIRE_SIZE: usize = 1 + 1 + 1 + 4 + 8 + 8 + 8; // 31
+    pub const WIRE_SIZE: usize = 1 + 1 + 1 + 8 + 4 + 8 + 8 + 8; // 39
 
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ProtoError> {
         if buf.len() < Self::WIRE_SIZE {
@@ -77,10 +84,11 @@ impl NewOrder {
         buf[0] = self.side;
         buf[1] = self.order_type;
         buf[2] = self.time_in_force;
-        buf[3..7].copy_from_slice(&self.symbol_id.to_le_bytes());
-        buf[7..15].copy_from_slice(&self.price.to_le_bytes());
-        buf[15..23].copy_from_slice(&self.quantity.to_le_bytes());
-        buf[23..31].copy_from_slice(&self.account_id.to_le_bytes());
+        buf[3..11].copy_from_slice(&self.gtd_timestamp.to_le_bytes());
+        buf[11..15].copy_from_slice(&self.symbol_id.to_le_bytes());
+        buf[15..23].copy_from_slice(&self.price.to_le_bytes());
+        buf[23..31].copy_from_slice(&self.quantity.to_le_bytes());
+        buf[31..39].copy_from_slice(&self.account_id.to_le_bytes());
         Ok(Self::WIRE_SIZE)
     }
 
@@ -92,15 +100,18 @@ impl NewOrder {
             side: buf[0],
             order_type: buf[1],
             time_in_force: buf[2],
-            symbol_id: u32::from_le_bytes([buf[3], buf[4], buf[5], buf[6]]),
-            price: i64::from_le_bytes([
-                buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14],
+            gtd_timestamp: u64::from_le_bytes([
+                buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
             ]),
-            quantity: u64::from_le_bytes([
+            symbol_id: u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]),
+            price: i64::from_le_bytes([
                 buf[15], buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22],
             ]),
-            account_id: u64::from_le_bytes([
+            quantity: u64::from_le_bytes([
                 buf[23], buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30],
+            ]),
+            account_id: u64::from_le_bytes([
+                buf[31], buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38],
             ]),
         })
     }
@@ -577,19 +588,33 @@ pub fn tif_to_wire(tif: tachyon_core::TimeInForce) -> u8 {
         tachyon_core::TimeInForce::IOC => TIF_IOC,
         tachyon_core::TimeInForce::FOK => TIF_FOK,
         tachyon_core::TimeInForce::PostOnly => TIF_POST_ONLY,
-        tachyon_core::TimeInForce::GTD(_) => TIF_GTC, // GTD not supported over binary proto, default GTC
+        tachyon_core::TimeInForce::GTD(_) => TIF_GTD,
     }
 }
 
-/// Convert a wire byte to a `TimeInForce`.
-pub fn tif_from_wire(b: u8) -> Result<tachyon_core::TimeInForce, ProtoError> {
+/// Extract the GTD expiry timestamp from a `TimeInForce` (0 for non-GTD).
+pub fn tif_gtd_timestamp(tif: tachyon_core::TimeInForce) -> u64 {
+    match tif {
+        tachyon_core::TimeInForce::GTD(ts) => ts,
+        _ => 0,
+    }
+}
+
+/// Convert a wire byte + GTD timestamp to a `TimeInForce`.
+pub fn tif_from_wire_with_gtd(b: u8, gtd_ts: u64) -> Result<tachyon_core::TimeInForce, ProtoError> {
     match b {
         TIF_GTC => Ok(tachyon_core::TimeInForce::GTC),
         TIF_IOC => Ok(tachyon_core::TimeInForce::IOC),
         TIF_FOK => Ok(tachyon_core::TimeInForce::FOK),
         TIF_POST_ONLY => Ok(tachyon_core::TimeInForce::PostOnly),
+        TIF_GTD => Ok(tachyon_core::TimeInForce::GTD(gtd_ts)),
         _ => Err(ProtoError::InvalidFieldValue("time_in_force", b)),
     }
+}
+
+/// Convert a wire byte to a `TimeInForce` (legacy: does not support GTD).
+pub fn tif_from_wire(b: u8) -> Result<tachyon_core::TimeInForce, ProtoError> {
+    tif_from_wire_with_gtd(b, 0)
 }
 
 /// Convert a `RejectReason` to its wire byte.
@@ -604,6 +629,7 @@ pub fn reject_reason_to_wire(reason: RejectReason) -> u8 {
         RejectReason::SelfTradePrevented => REJECT_SELF_TRADE,
         RejectReason::PostOnlyWouldTake => REJECT_POST_ONLY_WOULD_TAKE,
         RejectReason::DuplicateOrderId => REJECT_DUPLICATE_ORDER_ID,
+        RejectReason::OrderNotFound => REJECT_ORDER_NOT_FOUND,
     }
 }
 
@@ -619,6 +645,7 @@ pub fn reject_reason_from_wire(b: u8) -> RejectReason {
         REJECT_SELF_TRADE => RejectReason::SelfTradePrevented,
         REJECT_POST_ONLY_WOULD_TAKE => RejectReason::PostOnlyWouldTake,
         REJECT_DUPLICATE_ORDER_ID => RejectReason::DuplicateOrderId,
+        REJECT_ORDER_NOT_FOUND => RejectReason::OrderNotFound,
         _ => RejectReason::InsufficientLiquidity, // fallback
     }
 }
@@ -678,7 +705,7 @@ pub fn engine_event_to_server_msg(event: &EngineEvent) -> Option<ServerMessage> 
 pub fn new_order_to_core(msg: &NewOrder) -> Result<tachyon_core::Order, ProtoError> {
     let side = side_from_wire(msg.side)?;
     let order_type = order_type_from_wire(msg.order_type)?;
-    let time_in_force = tif_from_wire(msg.time_in_force)?;
+    let time_in_force = tif_from_wire_with_gtd(msg.time_in_force, msg.gtd_timestamp)?;
 
     Ok(tachyon_core::Order {
         id: OrderId::new(0), // Engine assigns the real ID
@@ -710,6 +737,7 @@ mod tests {
             side: SIDE_BUY,
             order_type: ORDER_TYPE_LIMIT,
             time_in_force: TIF_GTC,
+            gtd_timestamp: 0,
             symbol_id: 42,
             price: 5000150,
             quantity: 100_000_000,
@@ -728,6 +756,7 @@ mod tests {
             side: SIDE_BUY,
             order_type: ORDER_TYPE_LIMIT,
             time_in_force: TIF_GTC,
+            gtd_timestamp: 0,
             symbol_id: 0,
             price: 100,
             quantity: 10,
@@ -871,6 +900,7 @@ mod tests {
                 side: SIDE_SELL,
                 order_type: ORDER_TYPE_MARKET,
                 time_in_force: TIF_IOC,
+                gtd_timestamp: 0,
                 symbol_id: 1,
                 price: 0,
                 quantity: 500,
@@ -1079,6 +1109,14 @@ mod tests {
             tif_from_wire(tif_to_wire(TimeInForce::PostOnly)).unwrap(),
             TimeInForce::PostOnly
         );
+        // GTD roundtrip via tif_from_wire_with_gtd
+        let gtd_ts = 1_700_000_000_000_000_000u64;
+        let wire = tif_to_wire(TimeInForce::GTD(gtd_ts));
+        assert_eq!(wire, TIF_GTD);
+        assert_eq!(
+            tif_from_wire_with_gtd(wire, gtd_ts).unwrap(),
+            TimeInForce::GTD(gtd_ts)
+        );
         assert!(tif_from_wire(99).is_err());
     }
 
@@ -1094,6 +1132,7 @@ mod tests {
             RejectReason::SelfTradePrevented,
             RejectReason::PostOnlyWouldTake,
             RejectReason::DuplicateOrderId,
+            RejectReason::OrderNotFound,
         ];
         for reason in &reasons {
             let wire = reject_reason_to_wire(*reason);
@@ -1195,6 +1234,7 @@ mod tests {
             side: SIDE_BUY,
             order_type: ORDER_TYPE_LIMIT,
             time_in_force: TIF_GTC,
+            gtd_timestamp: 0,
             symbol_id: 0,
             price: 10000,
             quantity: 100,
@@ -1216,6 +1256,7 @@ mod tests {
             side: 99,
             order_type: ORDER_TYPE_LIMIT,
             time_in_force: TIF_GTC,
+            gtd_timestamp: 0,
             symbol_id: 0,
             price: 100,
             quantity: 10,
@@ -1234,6 +1275,7 @@ mod tests {
             side: SIDE_SELL,
             order_type: ORDER_TYPE_MARKET,
             time_in_force: TIF_FOK,
+            gtd_timestamp: 0,
             symbol_id: u32::MAX,
             price: i64::MIN,
             quantity: u64::MAX,
@@ -1251,6 +1293,7 @@ mod tests {
             side: 0,
             order_type: 0,
             time_in_force: 0,
+            gtd_timestamp: 0,
             symbol_id: 0,
             price: 0,
             quantity: 0,
@@ -1274,6 +1317,7 @@ mod tests {
                 side: SIDE_BUY,
                 order_type: ORDER_TYPE_LIMIT,
                 time_in_force: TIF_GTC,
+                gtd_timestamp: 0,
                 symbol_id: 0,
                 price: 100,
                 quantity: 10,
@@ -1282,8 +1326,115 @@ mod tests {
         };
         let buf = frame.encode_to_vec();
         let length = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        // length = msg_type(1) + seq_num(8) + payload(31) = 40
+        // length = msg_type(1) + seq_num(8) + payload(39) = 48
         assert_eq!(length, 1 + 8 + NewOrder::WIRE_SIZE as u32);
         assert_eq!(buf.len(), 4 + length as usize);
+    }
+
+    // -----------------------------------------------------------------------
+    // GTD encode/decode roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gtd_new_order_roundtrip() {
+        let expiry_ts = 1_700_000_000_000_000_000u64;
+        let msg = NewOrder {
+            side: SIDE_BUY,
+            order_type: ORDER_TYPE_LIMIT,
+            time_in_force: TIF_GTD,
+            gtd_timestamp: expiry_ts,
+            symbol_id: 0,
+            price: 50000,
+            quantity: 100,
+            account_id: 42,
+        };
+        let mut buf = [0u8; NewOrder::WIRE_SIZE];
+        let n = msg.encode(&mut buf).unwrap();
+        assert_eq!(n, NewOrder::WIRE_SIZE);
+        let decoded = NewOrder::decode(&buf).unwrap();
+        assert_eq!(msg, decoded);
+        assert_eq!(decoded.time_in_force, TIF_GTD);
+        assert_eq!(decoded.gtd_timestamp, expiry_ts);
+    }
+
+    #[test]
+    fn test_gtd_new_order_to_core_roundtrip() {
+        let expiry_ts = 1_700_000_000_000_000_000u64;
+        let msg = NewOrder {
+            side: SIDE_SELL,
+            order_type: ORDER_TYPE_LIMIT,
+            time_in_force: TIF_GTD,
+            gtd_timestamp: expiry_ts,
+            symbol_id: 1,
+            price: 60000,
+            quantity: 200,
+            account_id: 7,
+        };
+        let order = new_order_to_core(&msg).unwrap();
+        assert_eq!(
+            order.time_in_force,
+            tachyon_core::TimeInForce::GTD(expiry_ts)
+        );
+        assert_eq!(order.side, Side::Sell);
+        assert_eq!(order.account_id, 7);
+    }
+
+    #[test]
+    fn test_gtd_frame_roundtrip() {
+        let expiry_ts = 1_700_000_000_000_000_000u64;
+        let frame = Frame {
+            seq_num: 99,
+            message: ClientMessage::NewOrder(NewOrder {
+                side: SIDE_BUY,
+                order_type: ORDER_TYPE_LIMIT,
+                time_in_force: TIF_GTD,
+                gtd_timestamp: expiry_ts,
+                symbol_id: 3,
+                price: 12345,
+                quantity: 500,
+                account_id: 100,
+            }),
+        };
+        let buf = frame.encode_to_vec();
+        let decoded = Frame::<ClientMessage>::decode_body(&buf[4..]).unwrap();
+        assert_eq!(frame, decoded);
+        if let ClientMessage::NewOrder(order) = &decoded.message {
+            assert_eq!(order.time_in_force, TIF_GTD);
+            assert_eq!(order.gtd_timestamp, expiry_ts);
+        } else {
+            panic!("Expected NewOrder");
+        }
+    }
+
+    #[test]
+    fn test_non_gtd_has_zero_timestamp() {
+        // GTC order should have gtd_timestamp == 0
+        let msg = NewOrder {
+            side: SIDE_BUY,
+            order_type: ORDER_TYPE_LIMIT,
+            time_in_force: TIF_GTC,
+            gtd_timestamp: 0,
+            symbol_id: 0,
+            price: 100,
+            quantity: 10,
+            account_id: 1,
+        };
+        let mut buf = [0u8; NewOrder::WIRE_SIZE];
+        msg.encode(&mut buf).unwrap();
+        let decoded = NewOrder::decode(&buf).unwrap();
+        assert_eq!(decoded.gtd_timestamp, 0);
+        let order = new_order_to_core(&decoded).unwrap();
+        assert_eq!(order.time_in_force, tachyon_core::TimeInForce::GTC);
+    }
+
+    #[test]
+    fn test_tif_gtd_timestamp_helper() {
+        use tachyon_core::TimeInForce;
+        assert_eq!(tif_gtd_timestamp(TimeInForce::GTC), 0);
+        assert_eq!(tif_gtd_timestamp(TimeInForce::IOC), 0);
+        assert_eq!(tif_gtd_timestamp(TimeInForce::FOK), 0);
+        assert_eq!(tif_gtd_timestamp(TimeInForce::PostOnly), 0);
+        let ts = 12345678u64;
+        assert_eq!(tif_gtd_timestamp(TimeInForce::GTD(ts)), ts);
     }
 }

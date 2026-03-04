@@ -26,6 +26,18 @@ impl Matcher {
         self.trade_id_counter
     }
 
+    /// Returns the current trade ID counter value.
+    #[inline]
+    pub fn trade_id_counter(&self) -> u64 {
+        self.trade_id_counter
+    }
+
+    /// Sets the trade ID counter (used during recovery).
+    #[inline]
+    pub fn set_trade_id_counter(&mut self, val: u64) {
+        self.trade_id_counter = val;
+    }
+
     /// Main entry point: match an incoming order against the book.
     ///
     /// Dispatches based on order_type + time_in_force, emits events into a SmallVec.
@@ -75,9 +87,20 @@ impl Matcher {
 
                     // Add remainder to book
                     if !order.remaining_qty.is_zero() {
-                        // Ignore add_order error (e.g. BookFull) — in production
-                        // this would be handled, but for now we just place it.
-                        let _ = book.add_order(order);
+                        let rem_id = order.id;
+                        let rem_qty = order.remaining_qty;
+                        let rem_ts = order.timestamp;
+                        match book.add_order(order) {
+                            Ok(_) => {} // order resting on book
+                            Err(_) => {
+                                // Book couldn't accept the order, cancel the remainder
+                                events.push(EngineEvent::OrderCancelled {
+                                    order_id: rem_id,
+                                    remaining_qty: rem_qty,
+                                    timestamp: rem_ts,
+                                });
+                            }
+                        }
                     }
                 }
                 TimeInForce::IOC => {
@@ -139,7 +162,20 @@ impl Matcher {
                         timestamp: order.timestamp,
                     });
 
-                    let _ = book.add_order(order);
+                    let rem_id = order.id;
+                    let rem_qty = order.remaining_qty;
+                    let rem_ts = order.timestamp;
+                    match book.add_order(order) {
+                        Ok(_) => {} // order resting on book
+                        Err(_) => {
+                            // Book couldn't accept the order, cancel it
+                            events.push(EngineEvent::OrderCancelled {
+                                order_id: rem_id,
+                                remaining_qty: rem_qty,
+                                timestamp: rem_ts,
+                            });
+                        }
+                    }
                 }
             },
         }

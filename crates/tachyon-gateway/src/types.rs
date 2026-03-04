@@ -11,6 +11,10 @@ pub struct PlaceOrderRequest {
     pub time_in_force: String,
     pub price: Option<String>,
     pub quantity: String,
+    /// Optional account ID. If auth provides an account, that takes priority.
+    /// Otherwise uses this value, defaulting to 0 if absent.
+    #[serde(default)]
+    pub account_id: u64,
 }
 
 /// Response after placing an order.
@@ -169,6 +173,7 @@ mod tests {
             time_in_force: "GTC".to_string(),
             price: Some("50000.00".to_string()),
             quantity: "1.5".to_string(),
+            account_id: 0,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PlaceOrderRequest = serde_json::from_str(&json).expect("deserialize");
@@ -186,6 +191,7 @@ mod tests {
             time_in_force: "IOC".to_string(),
             price: None,
             quantity: "10.0".to_string(),
+            account_id: 0,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PlaceOrderRequest = serde_json::from_str(&json).expect("deserialize");

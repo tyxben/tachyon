@@ -254,6 +254,8 @@ async fn place_order(
         }
     };
 
+    let account_id = req.account_id;
+
     let order = Order {
         id: OrderId::new(0), // Engine assigns the real ID
         symbol,
@@ -264,13 +266,13 @@ async fn place_order(
         order_type,
         time_in_force,
         timestamp: 0,
-        account_id: 0,
+        account_id,
         prev: NO_LINK,
         next: NO_LINK,
     };
 
     let command = Command::PlaceOrder(order);
-    match state.bridge.send_order(command, symbol, 1).await {
+    match state.bridge.send_order(command, symbol, account_id).await {
         Ok(events) => {
             let mut order_id = 0u64;
             let mut status = "unknown".to_string();
@@ -314,7 +316,10 @@ async fn cancel_order(State(state): State<AppState>, Path(id): Path<u64>) -> imp
     let order_id = OrderId::new(id);
     // Look up the symbol this order belongs to.
     let symbol = {
-        let registry = state.order_registry.read().unwrap();
+        let registry = state
+            .order_registry
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         match registry.get(&id) {
             Some(&sym) => sym,
             None => {
@@ -371,7 +376,10 @@ async fn get_orderbook(
             .into_response();
     }
 
-    let snapshots = state.book_snapshots.read().unwrap();
+    let snapshots = state
+        .book_snapshots
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     let response = match snapshots.get(&symbol_name) {
         Some(snapshot) => snapshot.clone(),
         None => OrderBookResponse {
@@ -398,7 +406,10 @@ async fn get_trades(
             .into_response();
     }
 
-    let trades = state.recent_trades.read().unwrap();
+    let trades = state
+        .recent_trades
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     let symbol_trades = trades
         .get(&symbol_name)
         .map(|t| {

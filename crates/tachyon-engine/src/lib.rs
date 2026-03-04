@@ -10,7 +10,7 @@ pub mod risk;
 pub mod stp;
 
 pub use command::{Command, InboundCommand, SequencedCommand};
-pub use engine::SymbolEngine;
+pub use engine::{EngineSnapshot, SymbolEngine};
 pub use matcher::Matcher;
 pub use risk::{RiskConfig, RiskManager};
 pub use stp::{StpAction, StpMode};

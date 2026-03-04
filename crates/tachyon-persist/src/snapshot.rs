@@ -46,6 +46,15 @@ pub struct SymbolSnapshot {
     pub symbol: Symbol,
     pub config: SymbolConfig,
     pub orders: Vec<Order>,
+    /// The next order ID the engine should assign (preserves ID uniqueness across restarts).
+    #[serde(default)]
+    pub next_order_id: u64,
+    /// The engine sequence counter at snapshot time.
+    #[serde(default)]
+    pub sequence: u64,
+    /// The matcher's trade ID counter at snapshot time.
+    #[serde(default)]
+    pub trade_id_counter: u64,
 }
 
 /// Writes snapshots to disk with CRC integrity and atomic rename.
@@ -236,6 +245,9 @@ mod tests {
                         next: NO_LINK,
                     },
                 ],
+                next_order_id: 3,
+                sequence: seq,
+                trade_id_counter: 0,
             }],
         }
     }

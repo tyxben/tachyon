@@ -7,6 +7,16 @@ use crate::matcher::Matcher;
 use crate::risk::{RiskConfig, RiskManager};
 use crate::stp::StpMode;
 
+/// Full engine state snapshot data (all fields needed to persist and recover).
+pub struct EngineSnapshot {
+    pub symbol: Symbol,
+    pub config: SymbolConfig,
+    pub orders: Vec<Order>,
+    pub next_order_id: u64,
+    pub sequence: u64,
+    pub trade_id_counter: u64,
+}
+
 /// The top-level engine for a single symbol.
 ///
 /// Combines the order book, matcher, and risk manager into a cohesive unit.
@@ -92,7 +102,7 @@ impl SymbolEngine {
                     Err(_) => {
                         events.push(EngineEvent::OrderRejected {
                             order_id,
-                            reason: RejectReason::InvalidPrice, // order not found
+                            reason: RejectReason::OrderNotFound,
                             timestamp,
                         });
                     }
@@ -133,7 +143,7 @@ impl SymbolEngine {
                             Err(_) => {
                                 events.push(EngineEvent::OrderRejected {
                                     order_id,
-                                    reason: RejectReason::InvalidPrice,
+                                    reason: RejectReason::OrderNotFound,
                                     timestamp,
                                 });
                             }
@@ -142,7 +152,7 @@ impl SymbolEngine {
                     None => {
                         events.push(EngineEvent::OrderRejected {
                             order_id,
-                            reason: RejectReason::InvalidPrice,
+                            reason: RejectReason::OrderNotFound,
                             timestamp,
                         });
                     }
@@ -184,5 +194,41 @@ impl SymbolEngine {
     #[inline]
     pub fn set_sequence(&mut self, seq: u64) {
         self.sequence = seq;
+    }
+
+    /// Returns the next order ID the engine would assign.
+    #[inline]
+    pub fn next_order_id(&self) -> u64 {
+        self.next_order_id
+    }
+
+    /// Sets the next order ID (used during recovery).
+    #[inline]
+    pub fn set_next_order_id(&mut self, id: u64) {
+        self.next_order_id = id;
+    }
+
+    /// Returns the matcher's trade ID counter.
+    #[inline]
+    pub fn trade_id_counter(&self) -> u64 {
+        self.matcher.trade_id_counter()
+    }
+
+    /// Sets the matcher's trade ID counter (used during recovery).
+    #[inline]
+    pub fn set_trade_id_counter(&mut self, val: u64) {
+        self.matcher.set_trade_id_counter(val);
+    }
+
+    /// Captures the full engine state for snapshotting.
+    pub fn snapshot_full_state(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            symbol: self.book.symbol(),
+            config: self.book.config().clone(),
+            orders: self.book.get_all_orders(),
+            next_order_id: self.next_order_id,
+            sequence: self.sequence,
+            trade_id_counter: self.matcher.trade_id_counter(),
+        }
     }
 }

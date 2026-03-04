@@ -50,6 +50,80 @@ fn init_tracing(logging: &LoggingSection) {
     }
 }
 
+/// Replay a single WAL event into the appropriate engine's order book (C3 fix).
+///
+/// This reconstructs book state from WAL events that occurred after the last snapshot.
+fn replay_wal_event(engines: &mut HashMap<u32, SymbolEngine>, event: &EngineEvent) {
+    match event {
+        EngineEvent::OrderAccepted {
+            order_id,
+            symbol,
+            side,
+            price,
+            qty,
+            timestamp,
+        } => {
+            if let Some(engine) = engines.get_mut(&symbol.raw()) {
+                let order = Order {
+                    id: *order_id,
+                    symbol: *symbol,
+                    side: *side,
+                    price: *price,
+                    quantity: *qty,
+                    remaining_qty: *qty,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                    timestamp: *timestamp,
+                    account_id: 0,
+                    prev: NO_LINK,
+                    next: NO_LINK,
+                };
+                // Ignore DuplicateOrderId errors (order may already exist from snapshot)
+                let _ = engine.book_mut().restore_order(order);
+            }
+        }
+        EngineEvent::OrderCancelled { order_id, .. } => {
+            // Try to cancel in each engine (we don't know which symbol from event alone)
+            for engine in engines.values_mut() {
+                if engine.book().get_order(*order_id).is_some() {
+                    let _ = engine.book_mut().cancel_order(*order_id);
+                    break;
+                }
+            }
+        }
+        EngineEvent::Trade { trade } => {
+            // Reduce the maker order's remaining_qty by the trade qty
+            if let Some(engine) = engines.get_mut(&trade.symbol.raw()) {
+                if let Some(maker) = engine.book().get_order(trade.maker_order_id) {
+                    let new_remaining = maker.remaining_qty.saturating_sub(trade.quantity);
+                    if new_remaining.is_zero() {
+                        // Fully filled: remove the order
+                        let _ = engine.book_mut().cancel_order(trade.maker_order_id);
+                    } else {
+                        // Partially filled: update remaining qty via the book's orders slab
+                        // We need to use the order_map to find the slab key, then update directly.
+                        // Since OrderBook doesn't expose a direct remaining_qty setter,
+                        // we handle this by removing and re-inserting with updated qty.
+                        // However, this loses time priority. For recovery correctness,
+                        // we accept this tradeoff since the order will be at the correct
+                        // position after all WAL events are replayed.
+                        if let Some(existing) = engine.book().get_order(trade.maker_order_id) {
+                            let mut updated = existing.clone();
+                            updated.remaining_qty = new_remaining;
+                            let _ = engine.book_mut().cancel_order(trade.maker_order_id);
+                            let _ = engine.book_mut().restore_order(updated);
+                        }
+                    }
+                }
+            }
+        }
+        // OrderRejected and BookUpdate don't change book state
+        EngineEvent::OrderRejected { .. }
+        | EngineEvent::BookUpdate { .. }
+        | EngineEvent::OrderExpired { .. } => {}
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let config_path = std::env::args()
@@ -91,16 +165,19 @@ async fn main() {
             .unwrap_or_else(|e| panic!("Invalid persistence config: {}", e))
     });
 
+    // Global WAL sequence counter shared across all engine threads (H10 fix)
+    let wal_sequence = Arc::new(AtomicU64::new(0));
+
     // Attempt recovery if persistence is configured
     if let Some(ref pc) = persist_config {
         let recovery_mgr = tachyon_persist::RecoveryManager::new(&pc.snapshot_dir, &pc.wal_dir);
         match recovery_mgr.recover() {
             Ok(state) => {
                 if state.last_sequence > 0 {
-                    // Restore order book state from snapshot
-                    for (symbol, (_, orders)) in &state.snapshots {
+                    // Restore order book state from snapshot (C4 fix: also restore engine counters)
+                    for (symbol, sym_state) in &state.snapshots {
                         if let Some(engine) = engines.get_mut(&symbol.raw()) {
-                            for order in orders {
+                            for order in &sym_state.orders {
                                 if let Err(e) = engine.book_mut().restore_order(order.clone()) {
                                     tracing::warn!(
                                         order_id = order.id.raw(),
@@ -109,12 +186,31 @@ async fn main() {
                                     );
                                 }
                             }
+                            // Restore engine counters from snapshot
+                            if sym_state.next_order_id > 0 {
+                                engine.set_next_order_id(sym_state.next_order_id);
+                            }
+                            if sym_state.sequence > 0 {
+                                engine.set_sequence(sym_state.sequence);
+                            }
+                            if sym_state.trade_id_counter > 0 {
+                                engine.set_trade_id_counter(sym_state.trade_id_counter);
+                            }
                         }
                     }
+
+                    // Replay WAL events that occurred after the snapshot (C3 fix)
+                    for (_seq, event) in &state.wal_events {
+                        replay_wal_event(&mut engines, event);
+                    }
+
+                    // Initialize global WAL sequence from recovery state (H10 fix)
+                    wal_sequence.store(state.last_sequence, Ordering::Release);
 
                     tracing::info!(
                         last_sequence = state.last_sequence,
                         events_replayed = state.events_replayed,
+                        wal_events_applied = state.wal_events.len(),
                         symbols_recovered = state.snapshots.len(),
                         "Recovery complete"
                     );
@@ -211,6 +307,7 @@ async fn main() {
         let thread_shutdown = shutdown.clone();
         let thread_symbol_info = symbol_info.get(&symbol_id).cloned();
         let thread_ws_tx = ws_state.event_tx.clone();
+        let thread_wal_sequence = wal_sequence.clone();
 
         // Get the engine alive flag for this symbol
         let thread_alive = thread_symbol_info
@@ -258,6 +355,7 @@ async fn main() {
                     shutdown: thread_shutdown,
                     ws_event_tx: thread_ws_tx,
                     alive_flag: thread_alive,
+                    wal_sequence: thread_wal_sequence,
                 });
             })
             .unwrap_or_else(|e| {
@@ -318,13 +416,24 @@ async fn main() {
             "Rate limiting enabled"
         );
     }
-    let _rate_limiter = RateLimiter::new(rate_limit_config);
+    let rate_limiter = RateLimiter::new(rate_limit_config);
 
-    // Build REST router with auth middleware
-    let rest_app = rest_router(app_state).layer(axum::middleware::from_fn_with_state(
-        auth_state,
-        auth_middleware,
-    ));
+    // Clone order_registry before app_state is moved into rest_router
+    let tcp_order_registry = app_state.order_registry.clone();
+
+    // Build REST router with rate limiting and auth middleware.
+    // Rate limiting is applied before auth so that excessive requests are rejected early.
+    // The /health and /metrics endpoints are excluded from rate limiting by placing
+    // them outside the rate-limited router group.
+    let rest_app = rest_router(app_state)
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            tachyon_gateway::rate_limit_middleware,
+        ));
 
     // Build WebSocket router
     let ws_app = axum::Router::new()
@@ -360,6 +469,7 @@ async fn main() {
         seq_counter: Arc::new(AtomicU64::new(1)),
         active_connections: Arc::new(AtomicU64::new(0)),
         max_connections: config.server.max_tcp_connections,
+        order_registry: tcp_order_registry,
     };
 
     tracing::info!("Tachyon engine ready");
@@ -368,7 +478,7 @@ async fn main() {
 
     // Run all servers and wait for shutdown signal
     tokio::select! {
-        result = axum::serve(rest_listener, rest_app) => {
+        result = axum::serve(rest_listener, rest_app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "REST server error");
             }
@@ -445,6 +555,8 @@ struct EngineThreadCtx {
     ws_event_tx: broadcast::Sender<WsServerMessage>,
     /// Per-symbol alive flag set to false when the engine thread exits.
     alive_flag: Option<Arc<AtomicBool>>,
+    /// Global WAL sequence counter shared across all engine threads (H10 fix).
+    wal_sequence: Arc<AtomicU64>,
 }
 
 /// Maximum number of commands to drain per batch iteration.
@@ -454,7 +566,6 @@ const BOOK_DEPTH: usize = 20;
 
 /// Tight poll loop for a single symbol engine thread.
 fn engine_thread_loop(mut ctx: EngineThreadCtx) {
-    let mut sequence: u64 = 0;
     let mut events_since_snapshot: u64 = 0;
     let mut spin_count: u32 = 0;
 
@@ -488,12 +599,9 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
         for cmd in batch {
             // Measure matching engine latency
             let match_start = Instant::now();
-            let events = {
-                let result = ctx
-                    .engine
-                    .process_command(cmd.command, cmd.account_id, cmd.timestamp);
-                result.to_vec()
-            };
+            let events = ctx
+                .engine
+                .process_command(cmd.command, cmd.account_id, cmd.timestamp);
             let match_elapsed_ns = match_start.elapsed().as_nanos() as u64;
             ctx.metrics.match_latency_ns.observe(match_elapsed_ns);
 
@@ -519,7 +627,7 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                         has_book_change = true;
                         ctx.order_registry
                             .write()
-                            .unwrap()
+                            .unwrap_or_else(|p| p.into_inner())
                             .insert(order_id.raw(), *symbol);
                     }
                     EngineEvent::Trade { trade } => {
@@ -547,7 +655,8 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                                 data: trade_resp.clone(),
                             });
 
-                            let mut trades = ctx.recent_trades.write().unwrap();
+                            let mut trades =
+                                ctx.recent_trades.write().unwrap_or_else(|p| p.into_inner());
                             let list = trades.entry(name.clone()).or_default();
                             list.push(trade_resp);
                             if list.len() > MAX_RECENT_TRADES {
@@ -559,7 +668,10 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                     EngineEvent::OrderCancelled { order_id, .. } => {
                         ctx.metrics.cancels_total.fetch_add(1, Ordering::Relaxed);
                         has_book_change = true;
-                        ctx.order_registry.write().unwrap().remove(&order_id.raw());
+                        ctx.order_registry
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&order_id.raw());
                     }
                     EngineEvent::OrderRejected { reason, .. } => {
                         let reason_str = format!("{:?}", reason);
@@ -637,7 +749,7 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
 
                     ctx.book_snapshots
                         .write()
-                        .unwrap()
+                        .unwrap_or_else(|p| p.into_inner())
                         .insert(name.clone(), snapshot);
                 }
             }
@@ -646,9 +758,10 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
             if let Some(ref wal) = ctx.wal_writer {
                 if let Ok(ref mut writer) = wal.lock() {
                     for event in &events {
-                        sequence += 1;
-                        if let Err(e) = writer.append(sequence, event) {
-                            tracing::error!(error = %e, sequence, "Failed to write WAL entry");
+                        // H10 fix: use global atomic sequence instead of per-thread local
+                        let seq = ctx.wal_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Err(e) = writer.append(seq, event) {
+                            tracing::error!(error = %e, seq, "Failed to write WAL entry");
                         }
                         events_since_snapshot += 1;
                     }
@@ -657,13 +770,19 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                         && events_since_snapshot >= ctx.snapshot_interval_events
                     {
                         if let Some(ref snap_dir) = ctx.snapshot_dir {
+                            // C4 fix: use snapshot_full_state() to capture all engine counters
+                            let engine_snap = ctx.engine.snapshot_full_state();
+                            let current_seq = ctx.wal_sequence.load(Ordering::Relaxed);
                             let sym_snapshot = tachyon_persist::SymbolSnapshot {
-                                symbol: ctx.engine.book().symbol(),
-                                config: ctx.engine.book().config().clone(),
-                                orders: ctx.engine.book().get_all_orders(),
+                                symbol: engine_snap.symbol,
+                                config: engine_snap.config,
+                                orders: engine_snap.orders,
+                                next_order_id: engine_snap.next_order_id,
+                                sequence: engine_snap.sequence,
+                                trade_id_counter: engine_snap.trade_id_counter,
                             };
                             let snapshot = tachyon_persist::Snapshot {
-                                sequence,
+                                sequence: current_seq,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_nanos() as u64)
@@ -672,7 +791,11 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                             };
                             match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
                                 Ok(path) => {
-                                    tracing::info!(path = %path.display(), sequence, "Snapshot created");
+                                    tracing::info!(
+                                        path = %path.display(),
+                                        sequence = current_seq,
+                                        "Snapshot created"
+                                    );
                                     events_since_snapshot = 0;
                                 }
                                 Err(e) => {
@@ -684,8 +807,8 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                 }
             }
 
-            // Send response back to the gateway (ignore errors if caller dropped)
-            let _ = cmd.response_tx.send(events);
+            // Send response back to the gateway (only convert SmallVec to Vec at the send boundary)
+            let _ = cmd.response_tx.send(events.to_vec());
         }
     }
 

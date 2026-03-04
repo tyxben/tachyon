@@ -47,15 +47,17 @@ impl WsState {
 
 /// Axum handler for upgrading an HTTP connection to WebSocket.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> impl IntoResponse {
-    // Check connection limit before upgrading
+    // Atomic increment-then-check to avoid TOCTOU race on connection limits.
     if state.max_connections > 0 {
-        let current = state.active_connections.load(Ordering::Relaxed);
-        if current >= state.max_connections {
+        let prev = state.active_connections.fetch_add(1, Ordering::AcqRel);
+        if prev >= state.max_connections {
+            state.active_connections.fetch_sub(1, Ordering::AcqRel);
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+    } else {
+        state.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    state.active_connections.fetch_add(1, Ordering::Relaxed);
     ws.on_upgrade(move |socket| handle_socket(socket, state))
         .into_response()
 }
@@ -65,6 +67,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     let (mut sender, mut receiver) = socket.split();
     let mut subscriptions: HashSet<String> = HashSet::new();
     let mut event_rx = state.event_tx.subscribe();
+    let mut lag_count: u32 = 0;
 
     loop {
         tokio::select! {
@@ -106,10 +109,25 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
                             if sender.send(Message::Text(json)).await.is_err() {
                                 break;
                             }
+                            // Reset lag count on successful delivery
+                            lag_count = 0;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Client is too slow; skip missed messages
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        lag_count += 1;
+                        // Notify client about dropped messages
+                        let warning = serde_json::json!({
+                            "type": "warning",
+                            "message": format!("lagged: {} messages dropped", n)
+                        });
+                        if sender.send(Message::Text(warning.to_string())).await.is_err() {
+                            break;
+                        }
+                        // Disconnect after 3 consecutive lags
+                        if lag_count >= 3 {
+                            let _ = sender.send(Message::Close(None)).await;
+                            break;
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -751,5 +769,52 @@ mod tests {
         let result = handle_client_message(r#"{"method":"subscribe","params":[]}"#, &mut subs);
         assert!(subs.is_empty());
         assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection limit atomic correctness tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ws_connection_limit_atomic_increment_then_check() {
+        // Verify that the fetch_add/fetch_sub pattern correctly limits connections.
+        let state = WsState::with_limit(16, 2);
+
+        // Simulate two connections accepted (increment before check)
+        let prev1 = state.active_connections.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(prev1, 0); // under limit, accepted
+
+        let prev2 = state.active_connections.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(prev2, 1); // under limit, accepted
+
+        // Third connection: prev == 2, which is >= max_connections (2), should be rejected
+        let prev3 = state.active_connections.fetch_add(1, Ordering::AcqRel);
+        assert!(prev3 >= state.max_connections);
+        // Roll back the rejected increment
+        state.active_connections.fetch_sub(1, Ordering::AcqRel);
+
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
+
+        // Disconnect one
+        state.active_connections.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        // Now a new connection should succeed
+        let prev4 = state.active_connections.fetch_add(1, Ordering::AcqRel);
+        assert!(prev4 < state.max_connections);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_ws_unlimited_connections() {
+        // When max_connections is 0, there should be no limit
+        let state = WsState::new(16);
+        assert_eq!(state.max_connections, 0);
+
+        // Should freely increment
+        for _ in 0..100 {
+            state.active_connections.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 100);
     }
 }
