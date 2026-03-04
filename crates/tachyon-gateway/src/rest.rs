@@ -7,9 +7,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use std::sync::RwLock;
+
 use tachyon_core::*;
 use tachyon_engine::Command;
-use tokio::sync::RwLock;
 
 use crate::bridge::EngineBridge;
 use crate::types::*;
@@ -233,7 +234,7 @@ async fn cancel_order(State(state): State<AppState>, Path(id): Path<u64>) -> imp
     let order_id = OrderId::new(id);
     // Look up the symbol this order belongs to.
     let symbol = {
-        let registry = state.order_registry.read().await;
+        let registry = state.order_registry.read().unwrap();
         match registry.get(&id) {
             Some(&sym) => sym,
             None => {
@@ -290,7 +291,7 @@ async fn get_orderbook(
             .into_response();
     }
 
-    let snapshots = state.book_snapshots.read().await;
+    let snapshots = state.book_snapshots.read().unwrap();
     let response = match snapshots.get(&symbol_name) {
         Some(snapshot) => snapshot.clone(),
         None => OrderBookResponse {
@@ -317,7 +318,7 @@ async fn get_trades(
             .into_response();
     }
 
-    let trades = state.recent_trades.read().await;
+    let trades = state.recent_trades.read().unwrap();
     let symbol_trades = trades
         .get(&symbol_name)
         .map(|t| {
@@ -424,7 +425,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
-        let (bridge, _rx) = EngineBridge::new(16);
+        let (bridge, _queues) = EngineBridge::new(&[0], 16);
         let mut symbol_registry = HashMap::new();
         symbol_registry.insert("BTCUSDT".to_string(), Symbol::new(0));
 

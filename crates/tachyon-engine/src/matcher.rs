@@ -12,6 +12,7 @@ pub struct Matcher {
 
 impl Matcher {
     /// Creates a new Matcher with the given STP mode.
+    #[inline]
     pub fn new(stp_mode: StpMode) -> Self {
         Matcher {
             stp_mode,
@@ -19,6 +20,7 @@ impl Matcher {
         }
     }
 
+    #[inline(always)]
     fn next_trade_id(&mut self) -> u64 {
         self.trade_id_counter += 1;
         self.trade_id_counter
@@ -27,6 +29,7 @@ impl Matcher {
     /// Main entry point: match an incoming order against the book.
     ///
     /// Dispatches based on order_type + time_in_force, emits events into a SmallVec.
+    #[inline]
     pub fn match_order(
         &mut self,
         book: &mut OrderBook,
@@ -148,6 +151,7 @@ impl Matcher {
     ///
     /// Matches the incoming order against the opposing side of the book,
     /// emitting Trade and BookUpdate events.
+    #[inline]
     fn match_aggressive(
         &mut self,
         book: &mut OrderBook,
@@ -209,6 +213,7 @@ impl Matcher {
     }
 
     /// Match orders within a single price level.
+    #[inline]
     fn match_at_level(
         &mut self,
         book: &mut OrderBook,
@@ -368,6 +373,7 @@ impl Matcher {
     }
 
     /// Check if a PostOnly order would cross the spread.
+    #[inline]
     fn would_cross(&self, book: &OrderBook, order: &Order) -> bool {
         match order.side {
             Side::Buy => {
@@ -391,6 +397,7 @@ impl Matcher {
     ///
     /// Uses two separate branches for buy/sell because BTreeMap iterators
     /// (Iter vs Rev<Iter>) are different types.
+    #[inline]
     fn check_fok_liquidity(&self, book: &OrderBook, order: &Order) -> bool {
         let mut remaining = order.remaining_qty;
 

@@ -10,6 +10,7 @@ description = "API gateway (WebSocket, REST, FIX) for the Tachyon matching engin
 tachyon-core = { path = "../tachyon-core" }
 tachyon-engine = { path = "../tachyon-engine" }
 tachyon-book = { path = "../tachyon-book" }
+tachyon-io = { path = "../tachyon-io" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tokio-tungstenite = { workspace = true }

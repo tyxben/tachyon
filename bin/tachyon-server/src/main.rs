@@ -4,16 +4,19 @@ mod config;
 mod metrics;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use arrayvec::ArrayVec;
 use mimalloc::MiMalloc;
 use tachyon_core::*;
 use tachyon_engine::{RiskConfig, StpMode, SymbolEngine};
-use tachyon_gateway::bridge::{EngineBridge, OrderRequest};
+use tachyon_gateway::bridge::{EngineBridge, EngineCommand};
 use tachyon_gateway::rest::{rest_router, AppState};
+use tachyon_gateway::types::{OrderBookLevel, OrderBookResponse, TradeResponse};
 use tachyon_gateway::ws::{ws_handler, WsState};
-use tokio::sync::RwLock;
+use tachyon_io::SpscQueue;
 use tracing_subscriber::prelude::*;
 
 use crate::config::{load_config, LoggingSection};
@@ -104,7 +107,7 @@ async fn main() {
         }
     }
 
-    // Create WAL writer if persistence is configured
+    // Create WAL writer if persistence is configured (shared across engine threads via Mutex)
     let wal_writer = if let Some(ref pc) = persist_config {
         match tachyon_persist::WalWriter::new(
             &pc.wal_dir,
@@ -113,7 +116,7 @@ async fn main() {
         ) {
             Ok(w) => {
                 tracing::info!(wal_dir = %pc.wal_dir.display(), "WAL writer initialized");
-                Some(w)
+                Some(Arc::new(std::sync::Mutex::new(w)))
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create WAL writer");
@@ -127,10 +130,13 @@ async fn main() {
     // Initialize metrics
     let metrics = Arc::new(Metrics::new());
 
-    // Create engine bridge
-    let (bridge, mut engine_rx) = EngineBridge::new(4096);
+    // Collect symbol IDs for bridge creation
+    let symbol_ids: Vec<u32> = engines.keys().copied().collect();
 
-    // Shared state between dispatch loop and REST handlers
+    // Create engine bridge with per-symbol SPSC queues
+    let (bridge, engine_queues) = EngineBridge::new(&symbol_ids, 4096);
+
+    // Shared state between engine threads and REST handlers (std::sync::RwLock for sync engine threads)
     let recent_trades: Arc<RwLock<HashMap<String, Vec<TradeResponse>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     let book_snapshots: Arc<RwLock<HashMap<String, OrderBookResponse>>> =
@@ -145,28 +151,85 @@ async fn main() {
         }
     }
 
-    // Spawn engine dispatch loop
-    let engine_metrics = metrics.clone();
     let snapshot_dir = persist_config.as_ref().map(|pc| pc.snapshot_dir.clone());
     let snapshot_interval_events = persist_config
         .as_ref()
         .map(|pc| pc.snapshot_interval_events)
         .unwrap_or(0);
-    let mut dispatch_ctx = DispatchContext {
-        engines,
-        wal_writer,
-        metrics: engine_metrics,
-        snapshot_dir,
-        snapshot_interval_events,
-        symbol_info,
-        recent_trades: recent_trades.clone(),
-        book_snapshots: book_snapshots.clone(),
-        order_registry: order_registry.clone(),
-    };
 
-    tokio::spawn(async move {
-        engine_dispatch_loop(&mut engine_rx, &mut dispatch_ctx).await;
-    });
+    // Global shutdown flag for engine threads
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Get available CPU cores for affinity pinning
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+
+    // Spawn a dedicated OS thread per symbol engine
+    let mut engine_threads = Vec::new();
+    for (idx, (symbol_id, engine)) in engines.into_iter().enumerate() {
+        let queue = engine_queues
+            .get(&symbol_id)
+            .expect("missing SPSC queue for symbol")
+            .clone();
+
+        let thread_metrics = metrics.clone();
+        let thread_wal = wal_writer.clone();
+        let thread_snapshot_dir = snapshot_dir.clone();
+        let thread_recent_trades = recent_trades.clone();
+        let thread_book_snapshots = book_snapshots.clone();
+        let thread_order_registry = order_registry.clone();
+        let thread_shutdown = shutdown.clone();
+        let thread_symbol_info = symbol_info.get(&symbol_id).cloned();
+
+        // Pick a core for CPU pinning (round-robin across available cores, skip core 0 for OS)
+        let pin_core = if core_ids.len() > 1 {
+            Some(core_ids[1 + (idx % (core_ids.len() - 1))])
+        } else {
+            None
+        };
+
+        let handle = std::thread::Builder::new()
+            .name(format!("engine-{}", symbol_id))
+            .spawn(move || {
+                // Pin to CPU core
+                if let Some(core_id) = pin_core {
+                    if core_affinity::set_for_current(core_id) {
+                        tracing::info!(
+                            symbol_id,
+                            core = core_id.id,
+                            "Engine thread pinned to core"
+                        );
+                    } else {
+                        tracing::warn!(
+                            symbol_id,
+                            core = core_id.id,
+                            "Failed to pin engine thread to core"
+                        );
+                    }
+                }
+
+                engine_thread_loop(EngineThreadCtx {
+                    engine,
+                    queue,
+                    metrics: thread_metrics,
+                    wal_writer: thread_wal,
+                    snapshot_dir: thread_snapshot_dir,
+                    snapshot_interval_events,
+                    symbol_info: thread_symbol_info,
+                    recent_trades: thread_recent_trades,
+                    book_snapshots: thread_book_snapshots,
+                    order_registry: thread_order_registry,
+                    shutdown: thread_shutdown,
+                });
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to spawn engine thread for symbol {}: {}",
+                    symbol_id, e
+                )
+            });
+
+        engine_threads.push(handle);
+    }
 
     let bridge = Arc::new(bridge);
     let start_time = Instant::now();
@@ -245,99 +308,133 @@ async fn main() {
             tracing::info!("Shutting down...");
         }
     }
+
+    // Signal engine threads to stop and wait for them
+    shutdown.store(true, Ordering::Release);
+    for handle in engine_threads {
+        let _ = handle.join();
+    }
+
+    // Graceful shutdown: flush WAL
+    if let Some(ref wal) = wal_writer {
+        if let Ok(ref mut writer) = wal.lock() {
+            if let Err(e) = writer.flush() {
+                tracing::error!(error = %e, "Failed to flush WAL on shutdown");
+            } else {
+                tracing::info!("WAL flushed on shutdown");
+            }
+        }
+    }
 }
 
-use tachyon_gateway::types::{OrderBookLevel, OrderBookResponse, TradeResponse};
-
-struct DispatchContext {
-    engines: HashMap<u32, SymbolEngine>,
-    wal_writer: Option<tachyon_persist::WalWriter>,
+/// Per-symbol engine thread context.
+struct EngineThreadCtx {
+    engine: SymbolEngine,
+    queue: Arc<SpscQueue<EngineCommand>>,
     metrics: Arc<Metrics>,
+    wal_writer: Option<Arc<std::sync::Mutex<tachyon_persist::WalWriter>>>,
     snapshot_dir: Option<std::path::PathBuf>,
     snapshot_interval_events: u64,
-    symbol_info: HashMap<u32, (String, SymbolConfig)>,
+    symbol_info: Option<(String, SymbolConfig)>,
     recent_trades: Arc<RwLock<HashMap<String, Vec<TradeResponse>>>>,
     book_snapshots: Arc<RwLock<HashMap<String, OrderBookResponse>>>,
     order_registry: Arc<RwLock<HashMap<u64, Symbol>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
-async fn engine_dispatch_loop(
-    rx: &mut tokio::sync::mpsc::Receiver<OrderRequest>,
-    ctx: &mut DispatchContext,
-) {
+/// Maximum number of commands to drain per batch iteration.
+const BATCH_SIZE: usize = 64;
+const MAX_RECENT_TRADES: usize = 500;
+const BOOK_DEPTH: usize = 20;
+
+/// Tight poll loop for a single symbol engine thread.
+fn engine_thread_loop(mut ctx: EngineThreadCtx) {
     let mut sequence: u64 = 0;
     let mut events_since_snapshot: u64 = 0;
-    const MAX_RECENT_TRADES: usize = 500;
-    const BOOK_DEPTH: usize = 20;
+    let mut spin_count: u32 = 0;
 
-    while let Some(request) = rx.recv().await {
-        let symbol_id = request.symbol.raw();
-        let events = if let Some(engine) = ctx.engines.get_mut(&symbol_id) {
-            let result =
-                engine.process_command(request.command, request.account_id, request.timestamp);
-            result.to_vec()
-        } else {
-            vec![EngineEvent::OrderRejected {
-                order_id: OrderId::new(0),
-                reason: RejectReason::InvalidPrice,
-                timestamp: request.timestamp,
-            }]
-        };
+    loop {
+        let mut batch = ArrayVec::<EngineCommand, BATCH_SIZE>::new();
+        ctx.queue.drain_batch(&mut batch);
 
-        // Update metrics, trades, and order registry
-        let mut has_book_change = false;
-        for event in &events {
-            match event {
-                EngineEvent::OrderAccepted {
-                    order_id, symbol, ..
-                } => {
-                    ctx.metrics.orders_total.inc();
-                    has_book_change = true;
-                    ctx.order_registry
-                        .write()
-                        .await
-                        .insert(order_id.raw(), *symbol);
-                }
-                EngineEvent::Trade { trade } => {
-                    ctx.metrics.trades_total.inc();
-                    has_book_change = true;
-                    if let Some((name, config)) = ctx.symbol_info.get(&symbol_id) {
-                        let trade_resp = TradeResponse {
-                            trade_id: trade.trade_id,
-                            symbol: name.clone(),
-                            price: trade.price.format_with_scale(config.price_scale),
-                            quantity: format_qty_raw(trade.quantity.raw(), config.qty_scale),
-                            maker_side: match trade.maker_side {
-                                Side::Buy => "buy".to_string(),
-                                Side::Sell => "sell".to_string(),
-                            },
-                            timestamp: trade.timestamp,
-                        };
-                        let mut trades = ctx.recent_trades.write().await;
-                        let list = trades.entry(name.clone()).or_default();
-                        list.push(trade_resp);
-                        if list.len() > MAX_RECENT_TRADES {
-                            let drain_count = list.len() - MAX_RECENT_TRADES;
-                            list.drain(..drain_count);
-                        }
-                    }
-                }
-                EngineEvent::OrderCancelled { order_id, .. } => {
-                    has_book_change = true;
-                    ctx.order_registry.write().await.remove(&order_id.raw());
-                }
-                EngineEvent::BookUpdate { .. } => {
-                    has_book_change = true;
-                }
-                _ => {}
+        if batch.is_empty() {
+            if ctx.shutdown.load(Ordering::Acquire) {
+                break;
             }
+            // Progressive backoff: spin briefly, then yield to OS
+            spin_count += 1;
+            if spin_count < 1000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+                spin_count = 0;
+            }
+            continue;
         }
 
-        // Update book snapshot if the book changed
-        if has_book_change {
-            if let Some(engine) = ctx.engines.get(&symbol_id) {
-                if let Some((name, config)) = ctx.symbol_info.get(&symbol_id) {
-                    let (bids_raw, asks_raw) = engine.book().get_depth(BOOK_DEPTH);
+        spin_count = 0;
+
+        for cmd in batch {
+            let events = {
+                let result = ctx
+                    .engine
+                    .process_command(cmd.command, cmd.account_id, cmd.timestamp);
+                result.to_vec()
+            };
+
+            // Update metrics, trades, and order registry
+            let mut has_book_change = false;
+            for event in &events {
+                match event {
+                    EngineEvent::OrderAccepted {
+                        order_id, symbol, ..
+                    } => {
+                        ctx.metrics.orders_total.inc();
+                        has_book_change = true;
+                        ctx.order_registry
+                            .write()
+                            .unwrap()
+                            .insert(order_id.raw(), *symbol);
+                    }
+                    EngineEvent::Trade { trade } => {
+                        ctx.metrics.trades_total.inc();
+                        has_book_change = true;
+                        if let Some((ref name, ref config)) = ctx.symbol_info {
+                            let trade_resp = TradeResponse {
+                                trade_id: trade.trade_id,
+                                symbol: name.clone(),
+                                price: trade.price.format_with_scale(config.price_scale),
+                                quantity: format_qty_raw(trade.quantity.raw(), config.qty_scale),
+                                maker_side: match trade.maker_side {
+                                    Side::Buy => "buy".to_string(),
+                                    Side::Sell => "sell".to_string(),
+                                },
+                                timestamp: trade.timestamp,
+                            };
+                            let mut trades = ctx.recent_trades.write().unwrap();
+                            let list = trades.entry(name.clone()).or_default();
+                            list.push(trade_resp);
+                            if list.len() > MAX_RECENT_TRADES {
+                                let drain_count = list.len() - MAX_RECENT_TRADES;
+                                list.drain(..drain_count);
+                            }
+                        }
+                    }
+                    EngineEvent::OrderCancelled { order_id, .. } => {
+                        has_book_change = true;
+                        ctx.order_registry.write().unwrap().remove(&order_id.raw());
+                    }
+                    EngineEvent::BookUpdate { .. } => {
+                        has_book_change = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Update book snapshot if the book changed
+            if has_book_change {
+                if let Some((ref name, ref config)) = ctx.symbol_info {
+                    let (bids_raw, asks_raw) = ctx.engine.book().get_depth(BOOK_DEPTH);
                     let bids: Vec<OrderBookLevel> = bids_raw
                         .into_iter()
                         .map(|(price, qty)| OrderBookLevel {
@@ -364,76 +461,50 @@ async fn engine_dispatch_loop(
                     };
                     ctx.book_snapshots
                         .write()
-                        .await
+                        .unwrap()
                         .insert(name.clone(), snapshot);
                 }
             }
-        }
 
-        // Append events to WAL if persistence is configured
-        if let Some(ref mut writer) = ctx.wal_writer {
-            for event in &events {
-                sequence += 1;
-                if let Err(e) = writer.append(sequence, event) {
-                    tracing::error!(error = %e, sequence, "Failed to write WAL entry");
-                }
-                events_since_snapshot += 1;
-            }
-
-            if ctx.snapshot_interval_events > 0
-                && events_since_snapshot >= ctx.snapshot_interval_events
-            {
-                if let Some(ref snap_dir) = ctx.snapshot_dir {
-                    let snapshot = tachyon_persist::Snapshot {
-                        sequence,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0),
-                        symbols: Vec::new(),
-                    };
-                    match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
-                        Ok(path) => {
-                            tracing::info!(path = %path.display(), sequence, "Snapshot created");
-                            events_since_snapshot = 0;
+            // Append events to WAL if persistence is configured
+            if let Some(ref wal) = ctx.wal_writer {
+                if let Ok(ref mut writer) = wal.lock() {
+                    for event in &events {
+                        sequence += 1;
+                        if let Err(e) = writer.append(sequence, event) {
+                            tracing::error!(error = %e, sequence, "Failed to write WAL entry");
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to create snapshot");
+                        events_since_snapshot += 1;
+                    }
+
+                    if ctx.snapshot_interval_events > 0
+                        && events_since_snapshot >= ctx.snapshot_interval_events
+                    {
+                        if let Some(ref snap_dir) = ctx.snapshot_dir {
+                            let snapshot = tachyon_persist::Snapshot {
+                                sequence,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos() as u64)
+                                    .unwrap_or(0),
+                                symbols: Vec::new(),
+                            };
+                            match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
+                                Ok(path) => {
+                                    tracing::info!(path = %path.display(), sequence, "Snapshot created");
+                                    events_since_snapshot = 0;
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Failed to create snapshot");
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Ignore send errors (caller dropped the receiver)
-        let _ = request.response_tx.send(events);
-    }
-
-    // Graceful shutdown: flush WAL and create final snapshot
-    if let Some(ref mut writer) = ctx.wal_writer {
-        if let Err(e) = writer.flush() {
-            tracing::error!(error = %e, "Failed to flush WAL on shutdown");
-        } else {
-            tracing::info!("WAL flushed on shutdown");
-        }
-
-        if let Some(ref snap_dir) = ctx.snapshot_dir {
-            let snapshot = tachyon_persist::Snapshot {
-                sequence,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-                symbols: Vec::new(),
-            };
-            match tachyon_persist::SnapshotWriter::write(snap_dir, &snapshot) {
-                Ok(path) => {
-                    tracing::info!(path = %path.display(), sequence, "Final snapshot created on shutdown");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create final snapshot on shutdown");
-                }
-            }
+            // Send response back to the gateway (ignore errors if caller dropped)
+            let _ = cmd.response_tx.send(events);
         }
     }
 }

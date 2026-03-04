@@ -83,6 +83,36 @@ impl fmt::Display for Quantity {
     }
 }
 
+impl std::ops::Add for Quantity {
+    type Output = Quantity;
+    #[inline(always)]
+    fn add(self, rhs: Quantity) -> Quantity {
+        Quantity(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for Quantity {
+    type Output = Quantity;
+    #[inline(always)]
+    fn sub(self, rhs: Quantity) -> Quantity {
+        Quantity(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::AddAssign for Quantity {
+    #[inline(always)]
+    fn add_assign(&mut self, rhs: Quantity) {
+        self.0 += rhs.0;
+    }
+}
+
+impl std::ops::SubAssign for Quantity {
+    #[inline(always)]
+    fn sub_assign(&mut self, rhs: Quantity) {
+        self.0 -= rhs.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

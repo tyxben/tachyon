@@ -15,6 +15,7 @@ pub type DepthSide = Vec<(Price, Quantity)>;
 ///
 /// Uses `BTreeMap` for sorted price levels, `Slab` for O(1) order/level allocation,
 /// and `hashbrown::HashMap` for O(1) order lookup by ID.
+///
 pub struct OrderBook {
     symbol: Symbol,
     config: SymbolConfig,
@@ -130,6 +131,7 @@ impl OrderBook {
     ///
     /// Validates price alignment, quantity alignment, and bounds before insertion.
     /// The order is appended to the tail of the corresponding price level's linked list (FIFO).
+    #[inline]
     pub fn add_order(&mut self, mut order: Order) -> Result<(), EngineError> {
         self.validate_order(&order)?;
 
@@ -276,7 +278,7 @@ impl OrderBook {
     /// Returns the best bid price and its price level, or `None` if no bids exist.
     #[inline]
     pub fn best_bid(&self) -> Option<(Price, &PriceLevel)> {
-        let price = self.best_bid?;
+        let price = (self.best_bid)?;
         let &level_key = self.bids.get(&price)?;
         Some((price, &self.levels[level_key]))
     }
@@ -284,7 +286,7 @@ impl OrderBook {
     /// Returns the best ask price and its price level, or `None` if no asks exist.
     #[inline]
     pub fn best_ask(&self) -> Option<(Price, &PriceLevel)> {
-        let price = self.best_ask?;
+        let price = (self.best_ask)?;
         let &level_key = self.asks.get(&price)?;
         Some((price, &self.levels[level_key]))
     }
@@ -481,6 +483,7 @@ impl OrderBook {
     /// This is a low-level operation used by the matching engine when a resting
     /// order is fully filled. It handles unlinking, level aggregate updates,
     /// empty level cleanup, and BBO cache updates.
+    #[inline]
     pub fn remove_order_by_key(&mut self, order_key: usize) {
         let order = &self.orders[order_key];
         let side = order.side;

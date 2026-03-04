@@ -1560,6 +1560,7 @@ dependencies = [
  "tachyon-book",
  "tachyon-core",
  "tachyon-engine",
+ "tachyon-io",
  "tokio",
  "tokio-tungstenite",
  "tonic",
@@ -1593,13 +1594,16 @@ dependencies = [
 name = "tachyon-server"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "axum",
+ "core_affinity",
  "mimalloc",
  "prometheus",
  "serde",
  "tachyon-core",
  "tachyon-engine",
  "tachyon-gateway",
+ "tachyon-io",
  "tachyon-persist",
  "tokio",
  "toml",

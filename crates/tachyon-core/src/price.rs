@@ -123,6 +123,22 @@ impl fmt::Display for Price {
     }
 }
 
+impl std::ops::Add for Price {
+    type Output = Price;
+    #[inline(always)]
+    fn add(self, rhs: Price) -> Price {
+        Price(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for Price {
+    type Output = Price;
+    #[inline(always)]
+    fn sub(self, rhs: Price) -> Price {
+        Price(self.0 - rhs.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -102,22 +102,30 @@ pub const NO_LINK: u32 = u32::MAX;
 ///
 /// The `prev` and `next` fields form an intrusive doubly-linked list within a price level,
 /// using slab indices (`u32`). `u32::MAX` (`NO_LINK`) is the sentinel for "no link".
+///
+/// Field order is optimized to minimize padding with `#[repr(C)]`:
+/// 8-byte aligned fields first, then 4-byte, then 1-byte.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[repr(C)]
 pub struct Order {
+    // 8-byte aligned fields (48 bytes)
     pub id: OrderId,
-    pub symbol: Symbol,
-    pub side: Side,
     pub price: Price,
     pub quantity: Quantity,
     pub remaining_qty: Quantity,
-    pub order_type: OrderType,
-    pub time_in_force: TimeInForce,
     pub timestamp: u64,
     pub account_id: u64,
+    // 16-byte enum (tag + u64 payload)
+    pub time_in_force: TimeInForce,
+    // 4-byte aligned fields (12 bytes)
+    pub symbol: Symbol,
     /// Previous order in the same price level (slab index), `NO_LINK` if none.
     pub prev: u32,
     /// Next order in the same price level (slab index), `NO_LINK` if none.
     pub next: u32,
+    // 1-byte fields (2 bytes + 2 bytes padding = 4 bytes)
+    pub side: Side,
+    pub order_type: OrderType,
 }
 
 /// A completed trade between a maker and a taker order.

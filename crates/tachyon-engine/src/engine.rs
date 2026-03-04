@@ -40,6 +40,7 @@ impl SymbolEngine {
     }
 
     /// Processes a single command and returns the resulting events.
+    #[inline]
     pub fn process_command(
         &mut self,
         cmd: Command,
