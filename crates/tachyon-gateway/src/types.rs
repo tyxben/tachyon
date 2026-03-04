@@ -157,6 +157,63 @@ pub enum WsServerMessage {
     Error { message: String },
 }
 
+/// Query parameters for historical trade queries.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TradeQueryParams {
+    /// Start time (nanoseconds since epoch, inclusive).
+    pub start_time: Option<u64>,
+    /// End time (nanoseconds since epoch, exclusive).
+    pub end_time: Option<u64>,
+    /// Return trades starting from this trade ID (inclusive).
+    pub from_id: Option<u64>,
+    /// Maximum number of results (default 100, max 1000).
+    #[serde(default = "default_trade_limit")]
+    pub limit: usize,
+}
+
+fn default_trade_limit() -> usize {
+    100
+}
+
+/// Response for paginated historical trade queries.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TradeHistoryResponse {
+    pub symbol: String,
+    pub trades: Vec<TradeResponse>,
+    pub count: usize,
+}
+
+/// Query parameters for K-line (candlestick) queries.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KlineQueryParams {
+    /// Candlestick interval: "1s", "1m", "5m", "15m", "1h", "4h", "1d", "1w".
+    pub interval: String,
+    /// Start time (nanoseconds since epoch).
+    pub start_time: Option<u64>,
+    /// End time (nanoseconds since epoch).
+    pub end_time: Option<u64>,
+    /// Maximum number of candles (default 500, max 1500).
+    #[serde(default = "default_kline_limit")]
+    pub limit: Option<usize>,
+}
+
+fn default_kline_limit() -> Option<usize> {
+    Some(500)
+}
+
+/// A single K-line (OHLCV candlestick).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KlineResponse {
+    pub open_time: u64,
+    pub close_time: u64,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume: String,
+    pub trade_count: u64,
+}
+
 /// Known channel prefixes for subscription validation.
 pub const VALID_CHANNEL_PREFIXES: &[&str] = &["trades@", "orderbook@", "depth@", "ticker@"];
 

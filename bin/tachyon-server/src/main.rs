@@ -21,6 +21,7 @@ use tachyon_gateway::types::{
 use tachyon_gateway::ws::{ws_handler, WsState};
 use tachyon_gateway::{auth_middleware, AuthConfig, AuthState, RateLimitConfig, RateLimiter};
 use tachyon_io::SpscQueue;
+use tachyon_persist::{TradeRecord, TradeStore};
 use tokio::sync::broadcast;
 use tracing_subscriber::prelude::*;
 
@@ -246,6 +247,26 @@ async fn main() {
     // Initialize metrics
     let metrics = Arc::new(Metrics::new());
 
+    // Create persistent trade store for historical queries
+    let trade_store_dir = persist_config
+        .as_ref()
+        .map(|pc| pc.wal_dir.parent().unwrap_or(&pc.wal_dir).join("trades"))
+        .unwrap_or_else(|| std::path::PathBuf::from("data/trades"));
+
+    let trade_store = match TradeStore::new(&trade_store_dir) {
+        Ok(ts) => {
+            tracing::info!(dir = %trade_store_dir.display(), "Trade store initialized");
+            Some(Arc::new(ts))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create trade store, history disabled");
+            None
+        }
+    };
+
+    // Async channel: engine threads (sync) -> trade history writer task (async)
+    let (trade_tx, trade_rx) = tokio::sync::mpsc::unbounded_channel::<TradeRecord>();
+
     // Collect symbol IDs for bridge creation
     let symbol_ids: Vec<u32> = engines.keys().copied().collect();
 
@@ -307,6 +328,7 @@ async fn main() {
         let thread_symbol_info = symbol_info.get(&symbol_id).cloned();
         let thread_ws_tx = ws_state.event_tx.clone();
         let thread_wal_sequence = wal_sequence.clone();
+        let thread_trade_tx = trade_store.as_ref().map(|_| trade_tx.clone());
 
         // Get the engine alive flag for this symbol
         let thread_alive = thread_symbol_info
@@ -355,6 +377,7 @@ async fn main() {
                     ws_event_tx: thread_ws_tx,
                     alive_flag: thread_alive,
                     wal_sequence: thread_wal_sequence,
+                    trade_tx: thread_trade_tx,
                 });
             })
             .unwrap_or_else(|e| {
@@ -386,6 +409,7 @@ async fn main() {
         request_id_counter: Arc::new(AtomicU64::new(1)),
         metrics: Some(metrics.clone() as Arc<dyn tachyon_gateway::MetricsProvider>),
         symbol_names: Arc::new(symbol_names),
+        trade_store: trade_store.clone(),
     };
 
     // Build auth state
@@ -471,6 +495,16 @@ async fn main() {
         order_registry: tcp_order_registry,
     };
 
+    // Spawn async trade history writer task
+    let trade_writer_handle = if let Some(ref ts) = trade_store {
+        let ts = ts.clone();
+        Some(tokio::spawn(trade_history_writer(trade_rx, ts)))
+    } else {
+        // Drop rx so engine threads don't block on send
+        drop(trade_rx);
+        None
+    };
+
     tracing::info!("Tachyon engine ready");
 
     let shutdown_timeout_secs = config.server.shutdown_timeout_secs;
@@ -523,6 +557,13 @@ async fn main() {
         }
     }
 
+    // Drop trade_tx to signal trade writer to stop, then wait for it
+    drop(trade_tx);
+    if let Some(handle) = trade_writer_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        tracing::info!("Trade history writer stopped");
+    }
+
     // Graceful shutdown: flush WAL
     if let Some(ref wal) = wal_writer {
         if let Ok(ref mut writer) = wal.lock() {
@@ -556,6 +597,8 @@ struct EngineThreadCtx {
     alive_flag: Option<Arc<AtomicBool>>,
     /// Global WAL sequence counter shared across all engine threads (H10 fix).
     wal_sequence: Arc<AtomicU64>,
+    /// Channel to send trades to the async trade history writer (non-blocking).
+    trade_tx: Option<tokio::sync::mpsc::UnboundedSender<TradeRecord>>,
 }
 
 /// Maximum number of commands to drain per batch iteration.
@@ -650,6 +693,26 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                     EngineEvent::Trade { trade } => {
                         ctx.metrics.trades_total.fetch_add(1, Ordering::Relaxed);
                         has_book_change = true;
+
+                        // Send to persistent trade history (non-blocking)
+                        if let Some(ref tx) = ctx.trade_tx {
+                            let record = TradeRecord {
+                                timestamp: trade.timestamp,
+                                trade_id: trade.trade_id,
+                                symbol_id: trade.symbol.raw(),
+                                maker_side: match trade.maker_side {
+                                    Side::Buy => 0,
+                                    Side::Sell => 1,
+                                },
+                                _pad: [0; 3],
+                                price: trade.price.raw(),
+                                quantity: trade.quantity.raw(),
+                                maker_order_id: trade.maker_order_id.raw(),
+                                taker_order_id: trade.taker_order_id.raw(),
+                            };
+                            let _ = tx.send(record);
+                        }
+
                         if let Some((ref name, ref config)) = ctx.symbol_info {
                             let trade_resp = TradeResponse {
                                 trade_id: trade.trade_id,
@@ -818,6 +881,70 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
     // Signal that this engine thread has exited
     if let Some(ref flag) = ctx.alive_flag {
         flag.store(false, Ordering::Release);
+    }
+}
+
+/// Async task that drains trade records from engine threads and writes them to persistent storage.
+///
+/// Batches writes for efficiency — flushes after each drain or every 100ms if idle.
+async fn trade_history_writer(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<TradeRecord>,
+    store: Arc<TradeStore>,
+) {
+    use std::collections::HashMap;
+
+    let mut writers: HashMap<u32, tachyon_persist::TradeWriter> = HashMap::new();
+    let mut batch_count: u64 = 0;
+
+    loop {
+        // Wait for the first record
+        let record = match rx.recv().await {
+            Some(r) => r,
+            None => break, // Channel closed, shutdown
+        };
+
+        // Write this record
+        write_trade_record(&store, &mut writers, &record);
+        batch_count += 1;
+
+        // Drain any additional buffered records (non-blocking)
+        while let Ok(record) = rx.try_recv() {
+            write_trade_record(&store, &mut writers, &record);
+            batch_count += 1;
+        }
+
+        // Flush all writers after batch
+        for writer in writers.values_mut() {
+            let _ = writer.flush();
+        }
+
+        if batch_count % 10000 == 0 {
+            tracing::debug!(batch_count, "Trade history writer progress");
+        }
+    }
+
+    // Final flush
+    for writer in writers.values_mut() {
+        let _ = writer.flush();
+    }
+
+    tracing::info!(total = batch_count, "Trade history writer shutdown");
+}
+
+fn write_trade_record(
+    store: &TradeStore,
+    writers: &mut std::collections::HashMap<u32, tachyon_persist::TradeWriter>,
+    record: &TradeRecord,
+) {
+    let writer = writers
+        .entry(record.symbol_id)
+        .or_insert_with(|| {
+            store
+                .writer(record.symbol_id)
+                .expect("failed to open trade writer")
+        });
+    if let Err(e) = writer.append(record) {
+        tracing::error!(error = %e, trade_id = record.trade_id, "Failed to write trade record");
     }
 }
 

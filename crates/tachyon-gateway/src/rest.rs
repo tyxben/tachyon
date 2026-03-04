@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use std::sync::RwLock;
+
+use tachyon_persist::TradeStore;
 
 use tachyon_core::*;
 use tachyon_engine::Command;
@@ -37,6 +39,8 @@ pub struct AppState {
     pub metrics: Option<Arc<dyn MetricsProvider>>,
     /// List of configured symbol names for the status endpoint.
     pub symbol_names: Arc<Vec<String>>,
+    /// Persistent trade store for historical queries.
+    pub trade_store: Option<Arc<TradeStore>>,
 }
 
 /// Maximum number of recent trades returned per query.
@@ -50,6 +54,8 @@ pub fn rest_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/orderbook/:symbol", get(get_orderbook))
         .route("/api/v1/trades/:symbol", get(get_trades))
+        .route("/api/v1/history/trades/:symbol", get(get_trade_history))
+        .route("/api/v1/klines/:symbol", get(get_klines))
         .route("/api/v1/order", post(place_order))
         .route("/api/v1/order/:id", delete(cancel_order))
         .route("/api/v1/symbols", get(list_symbols))
@@ -421,6 +427,201 @@ async fn get_trades(
     (StatusCode::OK, Json(serde_json::json!(symbol_trades))).into_response()
 }
 
+/// Get historical trades with filtering and pagination.
+async fn get_trade_history(
+    State(state): State<AppState>,
+    Path(symbol_name): Path<String>,
+    Query(params): Query<TradeQueryParams>,
+) -> impl IntoResponse {
+    let symbol = match state.symbol_registry.get(&symbol_name) {
+        Some(s) => *s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "unknown symbol"})),
+            )
+                .into_response();
+        }
+    };
+
+    let trade_store = match &state.trade_store {
+        Some(ts) => ts,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "trade history not available"})),
+            )
+                .into_response();
+        }
+    };
+
+    let reader = match trade_store.reader(symbol.raw()) {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!(TradeHistoryResponse {
+                    symbol: symbol_name,
+                    trades: Vec::new(),
+                    count: 0,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let limit = params.limit.min(1000);
+    let config = state.symbol_configs.get(&symbol_name);
+
+    let records = if let Some(from_id) = params.from_id {
+        reader.query_from_id(from_id, limit)
+    } else {
+        let start = params.start_time.unwrap_or(0);
+        let end = params.end_time.unwrap_or(u64::MAX);
+        reader.query_time_range(start, end, limit)
+    };
+
+    match records {
+        Ok(recs) => {
+            let trades: Vec<TradeResponse> = recs
+                .iter()
+                .map(|r| record_to_trade_response(r, &symbol_name, config))
+                .collect();
+            let count = trades.len();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(TradeHistoryResponse {
+                    symbol: symbol_name,
+                    trades,
+                    count,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to read trade history: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Get K-line (candlestick) data.
+async fn get_klines(
+    State(state): State<AppState>,
+    Path(symbol_name): Path<String>,
+    Query(params): Query<KlineQueryParams>,
+) -> impl IntoResponse {
+    let symbol = match state.symbol_registry.get(&symbol_name) {
+        Some(s) => *s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "unknown symbol"})),
+            )
+                .into_response();
+        }
+    };
+
+    let interval_ns = match tachyon_persist::trade_store::parse_kline_interval(&params.interval) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid interval, expected: 1s, 1m, 5m, 15m, 1h, 4h, 1d, 1w"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let trade_store = match &state.trade_store {
+        Some(ts) => ts,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "trade history not available"})),
+            )
+                .into_response();
+        }
+    };
+
+    let reader = match trade_store.reader(symbol.raw()) {
+        Some(r) => r,
+        None => {
+            return (StatusCode::OK, Json(serde_json::json!(Vec::<KlineResponse>::new())))
+                .into_response();
+        }
+    };
+
+    let start = params.start_time.unwrap_or(0);
+    let end = params.end_time.unwrap_or(u64::MAX);
+    let limit = params.limit.unwrap_or(500).min(1500);
+
+    let config = state.symbol_configs.get(&symbol_name);
+
+    match reader.compute_klines(start, end, interval_ns, limit) {
+        Ok(klines) => {
+            let response: Vec<KlineResponse> = klines
+                .iter()
+                .map(|k| kline_to_response(k, config))
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to compute klines: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Convert a persistent TradeRecord to a REST TradeResponse.
+fn record_to_trade_response(
+    r: &tachyon_persist::TradeRecord,
+    symbol_name: &str,
+    config: Option<&SymbolConfig>,
+) -> TradeResponse {
+    let (price_scale, qty_scale) = config
+        .map(|c| (c.price_scale, c.qty_scale))
+        .unwrap_or((2, 8));
+
+    TradeResponse {
+        trade_id: r.trade_id,
+        symbol: symbol_name.to_string(),
+        price: Price::new(r.price).format_with_scale(price_scale),
+        quantity: format_qty(Quantity::new(r.quantity), qty_scale),
+        maker_side: if r.maker_side == 0 {
+            "buy".to_string()
+        } else {
+            "sell".to_string()
+        },
+        timestamp: r.timestamp,
+    }
+}
+
+/// Convert a Kline to a REST KlineResponse.
+fn kline_to_response(
+    k: &tachyon_persist::Kline,
+    config: Option<&SymbolConfig>,
+) -> KlineResponse {
+    let (price_scale, qty_scale) = config
+        .map(|c| (c.price_scale, c.qty_scale))
+        .unwrap_or((2, 8));
+
+    KlineResponse {
+        open_time: k.open_time,
+        close_time: k.close_time,
+        open: Price::new(k.open).format_with_scale(price_scale),
+        high: Price::new(k.high).format_with_scale(price_scale),
+        low: Price::new(k.low).format_with_scale(price_scale),
+        close: Price::new(k.close).format_with_scale(price_scale),
+        volume: format_qty(Quantity::new(k.volume), qty_scale),
+        trade_count: k.trade_count,
+    }
+}
+
 /// List all configured symbols.
 async fn list_symbols(State(state): State<AppState>) -> impl IntoResponse {
     let symbols: Vec<SymbolInfo> = state
@@ -661,6 +862,7 @@ mod tests {
             request_id_counter: Arc::new(AtomicU64::new(1)),
             metrics: None,
             symbol_names: Arc::new(vec!["BTCUSDT".to_string()]),
+            trade_store: None,
         }
     }
 
@@ -958,5 +1160,238 @@ mod tests {
         assert_eq!(parsed.symbols, vec!["BTCUSDT"]);
         assert_eq!(parsed.ws_connections_active, 0);
         assert_eq!(parsed.tcp_connections_active, 0);
+    }
+
+    #[tokio::test]
+    async fn test_trade_history_no_store() {
+        let state = test_state();
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/history/trades/BTCUSDT")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_trade_history_with_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            tachyon_persist::TradeStore::new(dir.path()).expect("trade store");
+
+        // Write test trades
+        {
+            let mut writer = store.writer(0).unwrap();
+            for i in 0..5u64 {
+                writer
+                    .append(&tachyon_persist::TradeRecord {
+                        timestamp: 1000 + i * 100,
+                        trade_id: i + 1,
+                        price: 5000000 + i as i64 * 100,
+                        quantity: 100_000_000,
+                        maker_order_id: 100 + i,
+                        taker_order_id: 200 + i,
+                        symbol_id: 0,
+                        maker_side: 0,
+                        _pad: [0; 3],
+                    })
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        let mut state = test_state();
+        state.trade_store = Some(Arc::new(store));
+        let app = rest_router(state);
+
+        // Query all trades
+        let req = Request::builder()
+            .uri("/api/v1/history/trades/BTCUSDT")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let parsed: TradeHistoryResponse = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(parsed.count, 5);
+        assert_eq!(parsed.trades.len(), 5);
+        assert_eq!(parsed.trades[0].trade_id, 1);
+        assert_eq!(parsed.trades[4].trade_id, 5);
+    }
+
+    #[tokio::test]
+    async fn test_trade_history_time_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            tachyon_persist::TradeStore::new(dir.path()).expect("trade store");
+
+        {
+            let mut writer = store.writer(0).unwrap();
+            for i in 0..10u64 {
+                writer
+                    .append(&tachyon_persist::TradeRecord {
+                        timestamp: 1000 + i * 100,
+                        trade_id: i + 1,
+                        price: 5000000,
+                        quantity: 100,
+                        maker_order_id: 100,
+                        taker_order_id: 200,
+                        symbol_id: 0,
+                        maker_side: 1,
+                        _pad: [0; 3],
+                    })
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        let mut state = test_state();
+        state.trade_store = Some(Arc::new(store));
+        let app = rest_router(state);
+
+        // Query time range [1200, 1700)
+        let req = Request::builder()
+            .uri("/api/v1/history/trades/BTCUSDT?start_time=1200&end_time=1700&limit=100")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let parsed: TradeHistoryResponse = serde_json::from_slice(&body).expect("parse");
+        // ts 1200, 1300, 1400, 1500, 1600 = 5 trades
+        assert_eq!(parsed.count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_trade_history_unknown_symbol() {
+        let mut state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        state.trade_store =
+            Some(Arc::new(tachyon_persist::TradeStore::new(dir.path()).unwrap()));
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/history/trades/UNKNOWN")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_klines_no_store() {
+        let state = test_state();
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/klines/BTCUSDT?interval=1m")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_klines_invalid_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        state.trade_store =
+            Some(Arc::new(tachyon_persist::TradeStore::new(dir.path()).unwrap()));
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/klines/BTCUSDT?interval=invalid")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_klines_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            tachyon_persist::TradeStore::new(dir.path()).expect("trade store");
+
+        // Write trades spanning 3 one-second candles
+        {
+            let ns = 1_000_000_000u64; // 1 second in ns
+            let mut writer = store.writer(0).unwrap();
+            // Candle 0: [0, 1s)
+            writer
+                .append(&tachyon_persist::TradeRecord {
+                    timestamp: 100_000_000,
+                    trade_id: 1,
+                    price: 5000000,
+                    quantity: 100_000_000,
+                    maker_order_id: 1,
+                    taker_order_id: 2,
+                    symbol_id: 0,
+                    maker_side: 0,
+                    _pad: [0; 3],
+                })
+                .unwrap();
+            // Candle 1: [1s, 2s)
+            writer
+                .append(&tachyon_persist::TradeRecord {
+                    timestamp: ns + 200_000_000,
+                    trade_id: 2,
+                    price: 5100000,
+                    quantity: 200_000_000,
+                    maker_order_id: 3,
+                    taker_order_id: 4,
+                    symbol_id: 0,
+                    maker_side: 1,
+                    _pad: [0; 3],
+                })
+                .unwrap();
+            writer
+                .append(&tachyon_persist::TradeRecord {
+                    timestamp: ns + 500_000_000,
+                    trade_id: 3,
+                    price: 4900000,
+                    quantity: 150_000_000,
+                    maker_order_id: 5,
+                    taker_order_id: 6,
+                    symbol_id: 0,
+                    maker_side: 0,
+                    _pad: [0; 3],
+                })
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        let mut state = test_state();
+        state.trade_store = Some(Arc::new(store));
+        let app = rest_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/klines/BTCUSDT?interval=1s")
+            .body(Body::empty())
+            .expect("build request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let parsed: Vec<KlineResponse> = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(parsed.len(), 2);
+
+        // Candle 0
+        assert_eq!(parsed[0].open_time, 0);
+        assert_eq!(parsed[0].trade_count, 1);
+
+        // Candle 1 (2 trades)
+        assert_eq!(parsed[1].trade_count, 2);
     }
 }

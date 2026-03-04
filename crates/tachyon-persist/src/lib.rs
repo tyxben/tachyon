@@ -1,14 +1,17 @@
-//! tachyon-persist: Write-ahead log and snapshot persistence.
+//! tachyon-persist: Write-ahead log, snapshot persistence, and trade history.
 //!
-//! Provides durable storage through WAL (write-ahead log) and
-//! periodic snapshots for crash recovery.
+//! Provides durable storage through WAL (write-ahead log),
+//! periodic snapshots for crash recovery, and append-only
+//! trade storage for historical queries.
 
 pub mod recovery;
 pub mod snapshot;
+pub mod trade_store;
 pub mod wal;
 
 pub use recovery::{RecoveredSymbolState, RecoveryManager, RecoveryState};
 pub use snapshot::{Snapshot, SnapshotReader, SnapshotWriter, SymbolSnapshot};
+pub use trade_store::{Kline, TradeReader, TradeRecord, TradeStore, TradeWriter};
 pub use wal::{WalCommand, WalEntry, WalReader, WalWriter};
 
 use std::path::PathBuf;

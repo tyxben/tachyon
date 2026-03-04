@@ -12,6 +12,7 @@ tachyon-engine = { path = "../tachyon-engine" }
 tachyon-book = { path = "../tachyon-book" }
 tachyon-io = { path = "../tachyon-io" }
 tachyon-proto = { path = "../tachyon-proto" }
+tachyon-persist = { path = "../tachyon-persist" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }
@@ -29,3 +30,4 @@ axum = { workspace = true }
 tower = "0.5"
 http-body-util = "0.1"
 serde_json = { workspace = true }
+tempfile = "3"
