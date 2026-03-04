@@ -12,8 +12,17 @@ use arrayvec::ArrayVec;
 
 /// Cache-line-padded wrapper to prevent false sharing.
 ///
-/// Apple Silicon (M1/M2/M3) uses 128-byte cache lines; x86-64 uses 64-byte.
-/// We align to 128 bytes for cross-platform compatibility.
+/// Alignment matches the target architecture's cache line size:
+/// - x86/x86_64: 64 bytes
+/// - aarch64 (Apple Silicon M1-M4, AWS Graviton): 128 bytes
+/// - other architectures: 128 bytes (conservative fallback)
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[repr(align(64))]
+struct CachePadded<T> {
+    value: T,
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 #[repr(align(128))]
 struct CachePadded<T> {
     value: T,

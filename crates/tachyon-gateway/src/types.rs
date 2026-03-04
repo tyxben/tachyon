@@ -66,6 +66,19 @@ pub struct SymbolInfo {
     pub max_order_qty: String,
 }
 
+/// Ticker (best bid/ask + last price) response.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TickerResponse {
+    pub symbol: String,
+    pub best_bid: Option<String>,
+    pub best_bid_qty: Option<String>,
+    pub best_ask: Option<String>,
+    pub best_ask_qty: Option<String>,
+    pub last_price: Option<String>,
+    pub last_qty: Option<String>,
+    pub timestamp: u64,
+}
+
 /// Health check response.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HealthResponse {
@@ -73,7 +86,9 @@ pub struct HealthResponse {
     pub uptime_secs: u64,
 }
 
-/// Messages sent from WebSocket clients.
+/// Messages sent from WebSocket clients (single-channel legacy format).
+///
+/// Format: `{"type":"subscribe","channel":"trades@BTCUSDT"}`
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum WsClientMessage {
@@ -81,6 +96,20 @@ pub enum WsClientMessage {
     Subscribe { channel: String },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { channel: String },
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+/// Messages sent from WebSocket clients (batch format).
+///
+/// Format: `{"method":"subscribe","params":["orderbook@BTCUSDT","trades@BTCUSDT"]}`
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "method")]
+pub enum WsClientBatchMessage {
+    #[serde(rename = "subscribe")]
+    Subscribe { params: Vec<String> },
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe { params: Vec<String> },
     #[serde(rename = "ping")]
     Ping,
 }
@@ -99,9 +128,14 @@ pub enum WsServerMessage {
     Trade { data: TradeResponse },
     #[serde(rename = "depth")]
     Depth { data: OrderBookResponse },
+    #[serde(rename = "ticker")]
+    Ticker { data: TickerResponse },
     #[serde(rename = "error")]
     Error { message: String },
 }
+
+/// Known channel prefixes for subscription validation.
+pub const VALID_CHANNEL_PREFIXES: &[&str] = &["trades@", "orderbook@", "depth@", "ticker@"];
 
 #[cfg(test)]
 mod tests {
@@ -337,5 +371,86 @@ mod tests {
         let json = r#"{"type":"invalid"}"#;
         let result = serde_json::from_str::<WsClientMessage>(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_client_batch_subscribe() {
+        let json = r#"{"method":"subscribe","params":["orderbook@BTCUSDT","trades@BTCUSDT"]}"#;
+        let msg: WsClientBatchMessage = serde_json::from_str(json).expect("deserialize");
+        match msg {
+            WsClientBatchMessage::Subscribe { params } => {
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[0], "orderbook@BTCUSDT");
+                assert_eq!(params[1], "trades@BTCUSDT");
+            }
+            _ => panic!("Expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn test_ws_client_batch_unsubscribe() {
+        let json = r#"{"method":"unsubscribe","params":["orderbook@BTCUSDT"]}"#;
+        let msg: WsClientBatchMessage = serde_json::from_str(json).expect("deserialize");
+        match msg {
+            WsClientBatchMessage::Unsubscribe { params } => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0], "orderbook@BTCUSDT");
+            }
+            _ => panic!("Expected Unsubscribe"),
+        }
+    }
+
+    #[test]
+    fn test_ws_client_batch_ping() {
+        let json = r#"{"method":"ping"}"#;
+        let msg: WsClientBatchMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(msg, WsClientBatchMessage::Ping));
+    }
+
+    #[test]
+    fn test_ws_server_message_ticker() {
+        let msg = WsServerMessage::Ticker {
+            data: TickerResponse {
+                symbol: "BTCUSDT".to_string(),
+                best_bid: Some("49999.00".to_string()),
+                best_bid_qty: Some("5.0".to_string()),
+                best_ask: Some("50001.00".to_string()),
+                best_ask_qty: Some("3.0".to_string()),
+                last_price: Some("50000.00".to_string()),
+                last_qty: Some("1.0".to_string()),
+                timestamp: 1000,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"ticker\""));
+        let parsed: WsServerMessage = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            WsServerMessage::Ticker { data } => {
+                assert_eq!(data.symbol, "BTCUSDT");
+                assert_eq!(data.best_bid, Some("49999.00".to_string()));
+                assert_eq!(data.best_ask, Some("50001.00".to_string()));
+                assert_eq!(data.last_price, Some("50000.00".to_string()));
+            }
+            _ => panic!("Expected Ticker"),
+        }
+    }
+
+    #[test]
+    fn test_ticker_response_roundtrip() {
+        let ticker = TickerResponse {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: None,
+            best_bid_qty: None,
+            best_ask: None,
+            best_ask_qty: None,
+            last_price: None,
+            last_qty: None,
+            timestamp: 2000,
+        };
+        let json = serde_json::to_string(&ticker).expect("serialize");
+        let parsed: TickerResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.symbol, "ETHUSDT");
+        assert!(parsed.best_bid.is_none());
+        assert!(parsed.last_price.is_none());
     }
 }

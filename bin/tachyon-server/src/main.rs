@@ -14,9 +14,12 @@ use tachyon_core::*;
 use tachyon_engine::{RiskConfig, StpMode, SymbolEngine};
 use tachyon_gateway::bridge::{EngineBridge, EngineCommand};
 use tachyon_gateway::rest::{rest_router, AppState};
-use tachyon_gateway::types::{OrderBookLevel, OrderBookResponse, TradeResponse};
+use tachyon_gateway::types::{
+    OrderBookLevel, OrderBookResponse, TickerResponse, TradeResponse, WsServerMessage,
+};
 use tachyon_gateway::ws::{ws_handler, WsState};
 use tachyon_io::SpscQueue;
+use tokio::sync::broadcast;
 use tracing_subscriber::prelude::*;
 
 use crate::config::{load_config, LoggingSection};
@@ -160,6 +163,10 @@ async fn main() {
     // Global shutdown flag for engine threads
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Create WebSocket state (broadcast channel for real-time market data push).
+    // Must be created before engine threads so they can publish events.
+    let ws_state = WsState::new(4096);
+
     // Get available CPU cores for affinity pinning
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
@@ -179,6 +186,7 @@ async fn main() {
         let thread_order_registry = order_registry.clone();
         let thread_shutdown = shutdown.clone();
         let thread_symbol_info = symbol_info.get(&symbol_id).cloned();
+        let thread_ws_tx = ws_state.event_tx.clone();
 
         // Pick a core for CPU pinning (round-robin across available cores, skip core 0 for OS)
         let pin_core = if core_ids.len() > 1 {
@@ -219,6 +227,7 @@ async fn main() {
                     book_snapshots: thread_book_snapshots,
                     order_registry: thread_order_registry,
                     shutdown: thread_shutdown,
+                    ws_event_tx: thread_ws_tx,
                 });
             })
             .unwrap_or_else(|e| {
@@ -244,9 +253,6 @@ async fn main() {
         order_registry,
         start_time,
     };
-
-    // Create WebSocket state
-    let ws_state = WsState::new(4096);
 
     // Build REST router with metrics endpoint
     let metrics_handle = metrics.clone();
@@ -340,6 +346,8 @@ struct EngineThreadCtx {
     book_snapshots: Arc<RwLock<HashMap<String, OrderBookResponse>>>,
     order_registry: Arc<RwLock<HashMap<u64, Symbol>>>,
     shutdown: Arc<AtomicBool>,
+    /// Broadcast sender for real-time WebSocket market data push.
+    ws_event_tx: broadcast::Sender<WsServerMessage>,
 }
 
 /// Maximum number of commands to drain per batch iteration.
@@ -382,8 +390,9 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                 result.to_vec()
             };
 
-            // Update metrics, trades, and order registry
+            // Update metrics, trades, order registry, and push WS market data
             let mut has_book_change = false;
+            let mut last_trade_price: Option<(String, String)> = None; // (price, qty)
             for event in &events {
                 match event {
                     EngineEvent::OrderAccepted {
@@ -411,6 +420,16 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                                 },
                                 timestamp: trade.timestamp,
                             };
+
+                            // Track last trade price for ticker update
+                            last_trade_price =
+                                Some((trade_resp.price.clone(), trade_resp.quantity.clone()));
+
+                            // Publish trade to WebSocket broadcast (ignore error if no subscribers)
+                            let _ = ctx.ws_event_tx.send(WsServerMessage::Trade {
+                                data: trade_resp.clone(),
+                            });
+
                             let mut trades = ctx.recent_trades.write().unwrap();
                             let list = trades.entry(name.clone()).or_default();
                             list.push(trade_resp);
@@ -431,7 +450,7 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                 }
             }
 
-            // Update book snapshot if the book changed
+            // Update book snapshot and push depth + ticker to WebSocket if the book changed
             if has_book_change {
                 if let Some((ref name, ref config)) = ctx.symbol_info {
                     let (bids_raw, asks_raw) = ctx.engine.book().get_depth(BOOK_DEPTH);
@@ -455,10 +474,33 @@ fn engine_thread_loop(mut ctx: EngineThreadCtx) {
                         .unwrap_or(0);
                     let snapshot = OrderBookResponse {
                         symbol: name.clone(),
-                        bids,
-                        asks,
+                        bids: bids.clone(),
+                        asks: asks.clone(),
                         timestamp: ts,
                     };
+
+                    // Publish depth snapshot to WebSocket broadcast
+                    let _ = ctx.ws_event_tx.send(WsServerMessage::Depth {
+                        data: snapshot.clone(),
+                    });
+
+                    // Publish ticker update to WebSocket broadcast
+                    let best_bid = bids.first();
+                    let best_ask = asks.first();
+                    let ticker = TickerResponse {
+                        symbol: name.clone(),
+                        best_bid: best_bid.map(|l| l.price.clone()),
+                        best_bid_qty: best_bid.map(|l| l.quantity.clone()),
+                        best_ask: best_ask.map(|l| l.price.clone()),
+                        best_ask_qty: best_ask.map(|l| l.quantity.clone()),
+                        last_price: last_trade_price.as_ref().map(|(p, _)| p.clone()),
+                        last_qty: last_trade_price.as_ref().map(|(_, q)| q.clone()),
+                        timestamp: ts,
+                    };
+                    let _ = ctx
+                        .ws_event_tx
+                        .send(WsServerMessage::Ticker { data: ticker });
+
                     ctx.book_snapshots
                         .write()
                         .unwrap()
